@@ -251,6 +251,7 @@ let rwbodyBox = [] // Body Rewrite
 let panelBox = [] //Panel信息
 let jsBox = [] //脚本
 let mockBox = [] //MapLocal或echo-response
+let loonRewriteV2Section = false
 let hnBox = [] //MITM主机名
 let fheBox = [] //force-http-engine
 let skipBox = [] //skip-ip
@@ -360,6 +361,23 @@ if (binaryInfo != null && binaryInfo.length > 0) {
     if (!/^(#|\/\/|;)/.test(x)) {
       x = x.replace(/\s+?(?:#|\/\/|;).*?$/, '')
     }
+    // Loon Rewrite V2 只在 [Rewrite] 段落中识别，避免把脚本里的 if 当成重写。
+    if (fromType === 'loon-plugin' && /^\[[^\]]+\]$/.test(x)) {
+      loonRewriteV2Section = /^\[Rewrite\]$/i.test(x)
+    }
+    if (fromType === 'loon-plugin' && loonRewriteV2Section && /^(?:request|response)\s+if\b/i.test(x)) {
+      const v2 = parseLoonRewriteV2(x)
+      if (v2.ok && v2.phase === 'request' && v2.condition.type === 'url-regex') {
+        mark = getMark(y, body)
+        rwBox.push({ mark, noteK: false, rwptn: loonV2RegexForLegacy(v2.condition.pattern, v2.condition.flags),
+          rwvalue: v2.action.type === 'redirect' ? v2.action.url : '-',
+          rwtype: v2.action.type === 'redirect' ? String(v2.action.status) : v2.action.type })
+      } else {
+        otherRule.push(`[Unsupported Loon Rewrite V2]\n${_x}`)
+      }
+      continue
+    }
+
     //去掉注释
     if (Pin0 != null) {
       for (let i = 0; i < Pin0.length; i++) {
@@ -2028,6 +2046,96 @@ async function getIcon(icon) {
     if (kicon[i].name == icon) return kicon[i].url
   }
   return 'icon not found'
+}
+
+// Loon Rewrite V2 parser.  This intentionally parses delimiters while aware of
+// regex literals, quoted strings and nested parentheses; split('/')/(',') is
+// not safe for this syntax.
+function parseLoonRewriteV2(line) {
+  const fail = reason => ({ ok: false, reason, raw: line })
+  const prefix = line.match(/^\s*(request|response)\s+if\s+/i)
+  if (!prefix) return fail('invalid statement')
+  const phase = prefix[1].toLowerCase()
+  const rest = line.slice(prefix[0].length)
+  const separators = [...rest.matchAll(/\s+then\s+/gi)]
+  for (const separator of separators) {
+    const condition = parseLoonRewriteV2Condition(rest.slice(0, separator.index).trim())
+    const action = parseLoonRewriteV2Action(rest.slice(separator.index + separator[0].length).trim())
+    if (condition && action) return { ok: true, version: 2, phase, condition, action, raw: line }
+  }
+  return fail('unsupported condition or action')
+}
+
+function parseLoonRewriteV2Condition(text) {
+  const match = text.match(/^\$\{url\}\s*~=\s*([\s\S]+)$/i)
+  if (!match) return null
+  const literal = parseLoonRegexLiteral(match[1].trim())
+  return literal && { type: 'url-regex', pattern: literal.pattern, flags: literal.flags }
+}
+
+function parseLoonRegexLiteral(text) {
+  if (text[0] !== '/') return null
+  let escaped = false
+  let inClass = false
+  let end = -1
+  for (let i = 1; i < text.length; i++) {
+    const ch = text[i]
+    if (escaped) { escaped = false; continue }
+    if (ch === '\\') { escaped = true; continue }
+    if (ch === '[') { inClass = true; continue }
+    if (ch === ']' && inClass) { inClass = false; continue }
+    if (ch === '/' && !inClass) { end = i; break }
+  }
+  if (end < 0) return null
+  const flags = text.slice(end + 1).trim()
+  if (!/^[ims]*$/i.test(flags) || new Set(flags.toLowerCase()).size !== flags.length) return null
+  return { pattern: text.slice(1, end), flags: flags.toLowerCase() }
+}
+
+function parseLoonRewriteV2Action(text) {
+  const match = text.match(/^([a-z_]+)\s*\(([\s\S]*)\)$/i)
+  if (!match) return null
+  const name = match[1].toLowerCase()
+  const args = splitLoonV2Args(match[2])
+  if (!args) return null
+  const status = args[0] ? Number(args[0].trim()) : 200
+  if (['reject_dict', 'reject_array', 'reject_img', 'reject_video'].includes(name)) {
+    return Number.isInteger(status) && status === 200 ? { type: name.replace('_', '-'), status } : null
+  }
+  if (name === 'reject') return Number.isInteger(status) && status === 200 ? { type: 'reject-200', status } : null
+  if (name === 'redirect' && (status === 302 || status === 307) && args.length === 2) {
+    const url = parseLoonV2String(args[1])
+    return url == null ? null : { type: 'redirect', status, url }
+  }
+  return null
+}
+
+function splitLoonV2Args(text) {
+  const result = []
+  let start = 0, quote = '', escaped = false, depth = 0
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (escaped) { escaped = false; continue }
+    if (ch === '\\' && quote) { escaped = true; continue }
+    if (quote) { if (ch === quote) quote = ''; continue }
+    if (ch === '"' || ch === "'") { quote = ch; continue }
+    if (ch === '(') depth++
+    else if (ch === ')') depth--
+    else if (ch === ',' && depth === 0) { result.push(text.slice(start, i).trim()); start = i + 1 }
+  }
+  if (quote || depth !== 0) return null
+  result.push(text.slice(start).trim())
+  return result
+}
+
+function parseLoonV2String(text) {
+  const value = text.trim()
+  if (!/^"(?:[^"\\]|\\.)*"$/.test(value) && !/^'(?:[^'\\]|\\.)*'$/.test(value)) return null
+  return value.slice(1, -1).replace(/\\([\\"'])/g, '$1')
+}
+
+function loonV2RegexForLegacy(pattern, flags) {
+  return flags ? `(?${flags})${pattern}` : pattern
 }
 
 //reject
