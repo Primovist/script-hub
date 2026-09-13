@@ -1,6 +1,6 @@
 <div align="center">
 <br>
-<img width="200" src="https://raw.githubusercontent.com/Script-Hub-Org/Script-Hub/main/assets/icon-dark.png" alt="Script Hub">
+<img width="200" src="https://raw.githubusercontent.com/Primovist/script-hub/main/assets/icon-dark.png" alt="Script Hub">
 <br>
 <br>
 <h1 align="center">Script Hub<h1>
@@ -41,13 +41,13 @@ Advanced Script Converter for QX, Loon, Surge, Stash, Egern, LanceX and Shadowro
 
 • 如果某些模块需要 `加参数才能使用` 但只想用远程链接，不想拉取到本地模块的情况 可以直接使用 `纯文本` -> `高级操作`、`修改参数` 功能修改远程链接 `任意内容` 或者 `argument` 参数, 不用再复制到本地模块
 
-• [🆕 不需要代理 app 的全服务器部署版(测试中)](<https://github.com/Script-Hub-Org/Script-Hub/wiki/%E5%85%A8%E6%9C%8D%E5%8A%A1%E5%99%A8%E7%89%88(%E6%B5%8B%E8%AF%95%E4%B8%AD)>)
+• [🆕 不需要代理 app 的全服务器部署版(测试中)](<https://github.com/Primovist/script-hub/wiki/%E5%85%A8%E6%9C%8D%E5%8A%A1%E5%99%A8%E7%89%88(%E6%B5%8B%E8%AF%95%E4%B8%AD)>)
 
-• 相关生态: [Surge 模块工具](https://github.com/Script-Hub-Org/Script-Hub/wiki/%E7%9B%B8%E5%85%B3%E7%94%9F%E6%80%81:-Surge-%E6%A8%A1%E5%9D%97%E5%B7%A5%E5%85%B7) 支持一键导入 Surge， 需要下载「Scriptable」app. 如果想把其他非 Script Hub 转换的 模块放在本地, 也可单独用此脚本
+• 相关生态: [Surge 模块工具](https://github.com/Primovist/script-hub/wiki/%E7%9B%B8%E5%85%B3%E7%94%9F%E6%80%81:-Surge-%E6%A8%A1%E5%9D%97%E5%B7%A5%E5%85%B7) 支持一键导入 Surge， 需要下载「Scriptable」app. 如果想把其他非 Script Hub 转换的 模块放在本地, 也可单独用此脚本
 
 ## 文档
 
-[安装体验请查看文档](https://github.com/Script-Hub-Org/Script-Hub/wiki)
+[安装体验请查看文档](https://github.com/Primovist/script-hub/wiki)
 
 ## 鸣谢
 
@@ -55,7 +55,7 @@ Powered by [_@Chavy‘s_](https://github.com/chavyleung) [Env.js](https://github
 原脚本作者 @小白脸  
 脚本修改[_@chengkongyiban_](https://github.com/chengkongyiban)  
 大量借鉴[_@KOP-XIAO_](https://github.com/KOP-XIAO)佬的[resource-parser.js](https://github.com/KOP-XIAO/QuantumultX/raw/master/Scripts/resource-parser.js)  
-感谢[_@xream_](https://github.com/xream) 佬提供与 [_@keywos_](https://github.com/keywos) 修改 `本项目 Script Hub 网页前端`, [replace-header.js](https://raw.githubusercontent.com/Script-Hub-Org/Script-Hub/main/scripts/replace-header.js)，[echo-response.js](https://raw.githubusercontent.com/Script-Hub-Org/Script-Hub/main/scripts/echo-response.js)，[script-converter.js](https://raw.githubusercontent.com/Script-Hub-Org/Script-Hub/main/script-converter.js)  
+感谢[_@xream_](https://github.com/xream) 佬提供与 [_@keywos_](https://github.com/keywos) 修改 `本项目 Script Hub 网页前端`, [replace-header.js](https://raw.githubusercontent.com/Primovist/script-hub/main/scripts/replace-header.js)，[echo-response.js](https://raw.githubusercontent.com/Primovist/script-hub/main/scripts/echo-response.js)，[script-converter.js](https://raw.githubusercontent.com/Primovist/script-hub/main/script-converter.js)
 感谢[_@mieqq_](https://github.com/mieqq) 佬提供的[replace-body.js](https://github.com/mieqq/mieqq/raw/master/replace-body.js), 本项目中已进行修改  
 感谢[_@Maasea_](https://github.com/Maasea) 佬的指导  
 项目 logo 感谢 [_@Toperlock_](https://github.com/Toperlock)  

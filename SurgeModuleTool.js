@@ -286,7 +286,7 @@ async function update() {
   let version
   let resp
   try {
-    const url = 'https://raw.githubusercontent.com/Script-Hub-Org/Script-Hub/main/SurgeModuleTool.js?v=' + Date.now()
+    const url = 'https://raw.githubusercontent.com/Primovist/script-hub/main/SurgeModuleTool.js?v=' + Date.now()
     let req = new Request(url)
     req.method = 'GET'
     req.headers = {

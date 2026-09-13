@@ -11,7 +11,7 @@
 插件图标用的 @Keikinn 的 StickerOnScreen项目 以及 @Toperlock 的图标库项目，感谢
 
 项目地址:
-https://github.com/Script-Hub-Org/Script-Hub
+https://github.com/Primovist/script-hub
 ***************************/
 
 const script_start = Date.now()
@@ -640,7 +640,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
           }
         }
       }
-      const jsurl = 'https://raw.githubusercontent.com/Script-Hub-Org/Script-Hub/main/scripts/body-rewrite.js'
+      const jsurl = 'https://raw.githubusercontent.com/Primovist/script-hub/main/scripts/body-rewrite.js'
       let jstype = `http-${httpType}`
       const jsptn = regex
       let args = [[action, newSuffixArray]]
@@ -2220,8 +2220,8 @@ function getQxReInfo(x, y, mark) {
   let jsptn = x.split(/\s+url\s+re/)[0].replace(/^#/, '')
   let jsname = /body/.test(hdorbd) ? 'replaceBody' : 'replaceHeader'
   let jsurl = /header/.test(hdorbd)
-    ? 'https://raw.githubusercontent.com/Script-Hub-Org/Script-Hub/main/scripts/replace-header.js'
-    : 'https://raw.githubusercontent.com/Script-Hub-Org/Script-Hub/main/scripts/replace-body.js'
+    ? 'https://raw.githubusercontent.com/Primovist/script-hub/main/scripts/replace-header.js'
+    : 'https://raw.githubusercontent.com/Primovist/script-hub/main/scripts/replace-body.js'
   let rearg1 = x.split(breakpoint)[1].trim()
   let rearg2 = x.split(breakpoint)[2].trim()
   let jsarg = encodeURIComponent(rearg1 + '->' + rearg2)
@@ -2432,7 +2432,7 @@ function getMockInfo(x, mark, y) {
           num: y,
         })
       } else if (m2rType == null && mocktype != 'file') {
-        jsurl = 'https://raw.githubusercontent.com/Script-Hub-Org/Script-Hub/main/scripts/echo-response.js'
+        jsurl = 'https://raw.githubusercontent.com/Primovist/script-hub/main/scripts/echo-response.js'
         mockstatus = mockstatus ? '&status-code=' + mockstatus : ''
         jsarg = `${mocktype}=` + encodeURIComponent(mockurl) + mockstatus
         jsBox.push({
