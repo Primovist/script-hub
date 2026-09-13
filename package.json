@@ -10,7 +10,7 @@
     "service": "nodemon service.js",
     "preview": "nodemon preview.js",
     "export_html": "cross-env EXPORT_HTML=true node preview.js",
-    "test": "find . -path './node_modules' -prune -o -name '*.js' -print0 | xargs -0 -n1 node --check"
+    "test": "node test/loon-rewrite-v2.test.js && find . -path './node_modules' -prune -o -name '*.js' -print0 | xargs -0 -n1 node --check"
   },
   "license": "GPL-3.0",
   "dependencies": {

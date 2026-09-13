@@ -251,6 +251,8 @@ let rwbodyBox = [] // Body Rewrite
 let panelBox = [] //Panel信息
 let jsBox = [] //脚本
 let mockBox = [] //MapLocal或echo-response
+let loonRewriteV2Section = false
+let loonV2Stats = { detectedV2Count: 0, convertedV2Count: 0, unsupportedV2Count: 0 }
 let hnBox = [] //MITM主机名
 let fheBox = [] //force-http-engine
 let skipBox = [] //skip-ip
@@ -367,19 +369,6 @@ if (binaryInfo != null && binaryInfo.length > 0) {
     if (fromType === 'loon-plugin' && /^\[[^\]]+\]$/.test(x)) {
       loonRewriteV2Section = /^\[Rewrite\]$/i.test(x)
     }
-    if (fromType === 'loon-plugin' && loonRewriteV2Section && /^(?:request|response)\s+if\b/i.test(x)) {
-      const v2 = parseLoonRewriteV2(x)
-      if (v2.ok && v2.phase === 'request' && v2.condition.type === 'url-regex') {
-        mark = getMark(y, body)
-        rwBox.push({ mark, noteK: false, rwptn: loonV2RegexForLegacy(v2.condition.pattern, v2.condition.flags),
-          rwvalue: v2.action.type === 'redirect' ? v2.action.url : '-',
-          rwtype: v2.action.type === 'redirect' ? String(v2.action.status) : v2.action.type })
-      } else {
-        otherRule.push(`[Unsupported Loon Rewrite V2]\n${_x}`)
-      }
-      continue
-    }
-
     //去掉注释
     if (Pin0 != null) {
       for (let i = 0; i < Pin0.length; i++) {
@@ -411,6 +400,22 @@ if (binaryInfo != null && binaryInfo.length > 0) {
     //剔除被注释的重写
     if (delNoteSc == true && /^#/.test(x) && !/^#!/.test(x)) {
       x = ''
+    }
+
+    if (fromType === 'loon-plugin' && loonRewriteV2Section && /^(?:request|response)\s+if\b/i.test(x)) {
+      loonV2Stats.detectedV2Count++
+      const v2 = parseLoonRewriteV2(x)
+      if (v2.ok && v2.phase === 'request' && v2.condition.type === 'url-regex') {
+        mark = getMark(y, body)
+        rwBox.push({ mark, noteK: false, rwptn: loonV2RegexForLegacy(v2.condition.pattern, v2.condition.flags),
+          rwvalue: v2.action.type === 'redirect' ? v2.action.url : '-',
+          rwtype: v2.action.type === 'redirect' ? String(v2.action.status) : v2.action.type })
+        loonV2Stats.convertedV2Count++
+      } else {
+        otherRule.push(`[Unsupported Loon Rewrite V2]\n${_x}`)
+        loonV2Stats.unsupportedV2Count++
+      }
+      continue
     }
 
     let flags = {}
