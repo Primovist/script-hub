@@ -404,7 +404,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
 
     if (fromType === 'loon-plugin' && loonScriptV2Section && isLoonScriptV2Statement(x)) {
       loonScriptV2Stats.detectedV2Count++
-      const v2 = parseLoonScriptV2(x)
+      const v2 = parseLoonScriptV2(x, sgArg)
       if (v2) {
         mark = getMark(y, body)
         jsBox.push({ mark, noteK: false, ...v2, ori: _x, num: y })
@@ -864,7 +864,12 @@ if (binaryInfo != null && binaryInfo.length > 0) {
         ? getJsInfo(x, /[=,]\s*pattern\s*=\s*/).replace(/"/g, '')
         : x.split(/\s+/)[1]
       jsptn = /cron|event|network-changed|generic|dns|rule/i.test(jstype) ? '' : jsptn
-      jsarg = getJsInfo(x, /[=,\s]\s*argument\s*=\s*/)
+      const legacyScriptArgument = parseLoonLegacyScriptArgument(x, fromType === 'loon-plugin' ? sgArg : null)
+      if (legacyScriptArgument.kind === 'invalid') {
+        otherRule.push(x)
+        continue
+      }
+      jsarg = legacyScriptArgument.present ? legacyScriptArgument.value : ''
       rebody = getJsInfo(x, /[=,\s]\s*requires-body\s*=\s*/)
       wakesys = getJsInfo(x, /[=,\s]\s*wake-system\s*=\s*/)
       cronexp = /cronexpr?\s*=\s*/.test(x)
@@ -923,6 +928,9 @@ if (binaryInfo != null && binaryInfo.length > 0) {
           updatetime,
           timeout,
           jsarg,
+          jsargPresent: legacyScriptArgument.present,
+          jsargKind: legacyScriptArgument.kind,
+          jsargKeys: legacyScriptArgument.keys,
           cronexp,
           wakesys,
           tilesicon,
@@ -1542,9 +1550,13 @@ if (binaryInfo != null && binaryInfo.length > 0) {
       jsarg = jsBox[i].jsarg ? jsBox[i].jsarg : ''
       ori = jsBox[i].ori
 
+      const originalJsarg = jsarg
       jsarg = reJsValue(nArgTarget || 'null', nArg, jsname, ori, jsarg)
         .replace(/t;amp;/g, '&')
         .replace(/t;add;/g, '+')
+      const scriptArgument = jsarg !== originalJsarg
+        ? { present: true, kind: 'string', keys: [] }
+        : getScriptArgumentMeta(jsBox[i])
 
       cronexp = reJsValue(nCron || 'null', ncronexp, jsname, ori, cronexp)
 
@@ -1566,8 +1578,11 @@ if (binaryInfo != null && binaryInfo.length > 0) {
           timeout = timeout ? ', timeout=' + timeout : ''
           engine = engine && isSurgeiOS ? ', engine=' + engine : ''
           jsenable = jsenable && isLooniOS ? ', enable=' + jsenable : ''
-          if (jsarg != '' && /,/.test(jsarg) && !/^".+"$/.test(jsarg)) jsarg = ', argument="' + jsarg + '"'
-          if (jsarg != '' && (!/,/.test(jsarg) || /^".+"$/.test(jsarg))) jsarg = ', argument=' + jsarg
+          jsarg = formatScriptArgument(jsarg, scriptArgument, targetApp)
+          if (jsarg == null) {
+            otherRule.push(ori)
+            continue
+          }
 
           if (/generic/.test(jstype) && isShadowrocket) {
             otherRule.push(ori)
@@ -1721,16 +1736,20 @@ if (binaryInfo != null && binaryInfo.length > 0) {
       size = jsBox[i].size ? noteKn6 + 'max-size: ' + jsBox[i].size : ''
       cronexp = jsBox[i].cronexp ? jsBox[i].cronexp.replace(/"/g, '') : null
       timeout = jsBox[i].timeout ? jsBox[i].timeout : ''
-      jsarg = jsBox[i].jsarg ? jsBox[i].jsarg.replace(/^"(.+)"$/, '$1') : ''
+      jsarg = jsBox[i].jsarg != null ? jsBox[i].jsarg.replace(/^"([\s\S]*)"$/, '$1') : ''
       tilesicon = jsBox[i].tilesicon ? jsBox[i].tilesicon : ''
       tilescolor = jsBox[i].tilescolor ? jsBox[i].tilescolor : ''
       ori = jsBox[i].ori
 
       tilescolor = reJsValue(nTilesTarget || 'null', ntilescolor, jsname, ori, tilescolor).replace(/@/g, '#')
 
+      const originalJsarg = jsarg
       jsarg = reJsValue(nArgTarget || 'null', nArg, jsname, ori, jsarg)
         .replace(/t;amp;/g, '&')
         .replace(/t;add;/g, '+')
+      const scriptArgument = jsarg !== originalJsarg
+        ? { present: true, kind: 'string', keys: [] }
+        : getScriptArgumentMeta(jsBox[i])
 
       cronexp = reJsValue(nCron || 'null', ncronexp, jsname, ori, cronexp)
 
@@ -1740,12 +1759,15 @@ if (binaryInfo != null && binaryInfo.length > 0) {
 
       engine = reJsValue(enginet || 'null', enginev, jsname, ori, engine)
 
-      jsarg =
-        jsarg && jstype == 'generic'
-          ? noteKn4 + 'argument: |-' + noteKn6 + jsarg
-          : jsarg && jstype != 'generic'
-          ? noteKn6 + 'argument: |-' + noteKn8 + jsarg
-          : ''
+      if (scriptArgument.kind === 'object') {
+        otherRule.push(ori)
+        continue
+      }
+      jsarg = scriptArgument.present
+        ? jstype == 'generic'
+          ? noteKn4 + (jsarg === '' ? 'argument: ""' : 'argument: |-' + noteKn6 + jsarg)
+          : noteKn6 + (jsarg === '' ? 'argument: ""' : 'argument: |-' + noteKn8 + jsarg)
+        : ''
 
       timeout =
         timeout && jstype == 'generic'
@@ -2073,7 +2095,7 @@ function isLoonScriptV2Statement(line) {
     /^(?:cron\s+.+|network-changed|generic)\s+then\s+script\s*\(/i.test(line)
 }
 
-function parseLoonScriptV2(line) {
+function parseLoonScriptV2(line, declaredArguments) {
   let jstype, jsptn = '', cronexp = '', rest
   const http = line.match(/^\s*(request|response)\s+if\s+/i)
   if (http) {
@@ -2107,7 +2129,7 @@ function parseLoonScriptV2(line) {
   }
 
   const split = splitLoonScriptWith(rest)
-  const call = split && parseLoonScriptCall(split.action)
+  const call = split && parseLoonScriptCall(split.action, declaredArguments)
   const options = split && parseLoonScriptOptions(split.options)
   if (!call || !options) return null
   const jsname = options.tag || call.path.substring(call.path.lastIndexOf('/') + 1).replace(/\.js(?:\?.*)?$/, '')
@@ -2116,7 +2138,10 @@ function parseLoonScriptV2(line) {
     jsptn,
     cronexp,
     jsurl: call.path,
-    jsarg: call.argument || '',
+    jsarg: call.argument.value == null ? '' : call.argument.value,
+    jsargPresent: call.argument.present,
+    jsargKind: call.argument.kind,
+    jsargKeys: call.argument.keys,
     jsname,
     img: options.img_url || '',
     timeout: options.timeout ? String(options.timeout) : '',
@@ -2130,9 +2155,9 @@ function splitLoonScriptWith(text) {
   for (let i = 0; i < text.length; i++) {
     const ch = text[i]
     if (escaped) { escaped = false; continue }
-    if (ch === '\\' && quote) { escaped = true; continue }
+    if (ch === '\\' && quote && quote !== '`') { escaped = true; continue }
     if (quote) { if (ch === quote) quote = ''; continue }
-    if (ch === '"') { quote = ch; continue }
+    if (ch === '"' || ch === '`') { quote = ch; continue }
     if (ch === '(') depth++
     else if (ch === ')') depth--
     else if (depth === 0 && /^\s+with\s+/i.test(text.slice(i))) {
@@ -2143,15 +2168,94 @@ function splitLoonScriptWith(text) {
   return quote || depth !== 0 ? null : { action: text.trim(), options: '' }
 }
 
-function parseLoonScriptCall(text) {
+function parseLoonScriptCall(text, declaredArguments) {
   const match = text.match(/^script\s*\(([\s\S]*)\)$/i)
   if (!match) return null
   const args = splitLoonV2Args(match[1])
   if (!args || args.length < 1 || args.length > 2) return null
   const path = parseLoonV2String(args[0])
-  const argument = args.length === 2 ? parseLoonV2String(args[1]) : ''
-  if (!path || /\$\{[^}]+\}/.test(path) || argument == null || /\$\{[^}]+\}/.test(argument)) return null
+  const argument = parseLoonScriptArgument(args.length === 2 ? args[1] : undefined, declaredArguments)
+  if (!path || /\$\{[^}]+\}/.test(path) || !argument) return null
   return { path, argument }
+}
+
+function parseLoonScriptArgument(text, declaredArguments) {
+  if (typeof text === 'undefined') return { present: false, kind: 'none', value: null, keys: [] }
+  const source = text.trim()
+  const stringValue = parseLoonV2String(source)
+  if (stringValue != null) {
+    if (/\$\{[^}]+\}/.test(stringValue)) return null
+    return { present: true, kind: 'string', value: stringValue, keys: [] }
+  }
+  if (/^`[^`]*`$/.test(source)) {
+    return { present: true, kind: 'string', value: source.slice(1, -1), keys: [], raw: true }
+  }
+  const object = parseLoonPluginObjectArgument(source, declaredArguments, true)
+  return object && { present: true, kind: 'object', value: `{${object.keys.join(',')}}`, keys: object.keys }
+}
+
+function parseLoonPluginObjectArgument(text, declaredArguments, v2 = false) {
+  const source = `${text ?? ''}`.trim()
+  if (!/^\{[\s\S]*\}$/.test(source)) return null
+  const body = source.slice(1, -1).trim()
+  if (!body) return null
+  const entries = splitLoonV2Args(body)
+  if (!entries) return null
+  const pattern = v2 ? /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/ : /^\$?\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/
+  const keys = entries.map(entry => entry.trim().match(pattern)?.[1]).filter(Boolean)
+  if (keys.length !== entries.length || new Set(keys).size !== keys.length) return null
+  if (Array.isArray(declaredArguments)) {
+    const declared = new Set(declaredArguments.map(item => typeof item === 'string' ? item : item?.key).filter(Boolean))
+    if (keys.some(key => !declared.has(key))) return null
+  }
+  return { keys }
+}
+
+function parseLoonLegacyScriptArgument(line, declaredArguments) {
+  const matched = line.match(/(?:^|[,\s])argument\s*=\s*/i)
+  if (!matched) return { present: false, kind: 'none', value: null, keys: [] }
+  const start = matched.index + matched[0].length
+  const tail = line.slice(start)
+  let quote = '', escaped = false, braceDepth = 0, end = tail.length
+  for (let i = 0; i < tail.length; i++) {
+    const ch = tail[i]
+    if (escaped) { escaped = false; continue }
+    if (ch === '\\' && quote) { escaped = true; continue }
+    if (quote) { if (ch === quote) quote = ''; continue }
+    if (ch === '"' || ch === "'") { quote = ch; continue }
+    if (ch === '{') braceDepth++
+    else if (ch === '}') braceDepth--
+    else if (ch === ',' && braceDepth === 0 && /^\s*(?:script-path|pattern|timeout|argument|script-update-interval|requires-body|max-size|ability|binary-body-mode|cronexpr?|wake-system|enabled?|engine|tag|type|img-url|debug|event-name|desc)\s*=/i.test(tail.slice(i + 1))) { end = i; break }
+  }
+  if (quote || braceDepth !== 0) return { present: false, kind: 'invalid', value: null, keys: [] }
+  const source = tail.slice(0, end).trim()
+  const object = Array.isArray(declaredArguments) ? parseLoonPluginObjectArgument(source, declaredArguments, false) : null
+  if (object) return { present: true, kind: 'object', value: `{${object.keys.join(',')}}`, keys: object.keys }
+  if (Array.isArray(declaredArguments) && /^\{[\s\S]*\}$/.test(source)) return { present: false, kind: 'invalid', value: null, keys: [] }
+  if (/^"(?:[^"\\]|\\.)*"$/.test(source)) {
+    try { return { present: true, kind: 'string', value: JSON.parse(source), keys: [] } } catch { /* preserve below */ }
+  }
+  return { present: true, kind: 'string', value: source.replace(/^'([\s\S]*)'$/, '$1'), keys: [] }
+}
+
+function getScriptArgumentMeta(script) {
+  if (typeof script.jsargPresent === 'boolean') {
+    return { present: script.jsargPresent, kind: script.jsargKind || 'string', keys: script.jsargKeys || [] }
+  }
+  return { present: !!script.jsarg, kind: 'legacy', keys: [] }
+}
+
+function formatScriptArgument(value, argument, outputTarget) {
+  if (!argument.present) return ''
+  if (argument.kind === 'object') {
+    if (outputTarget === 'loon-plugin') return `, argument={${argument.keys.join(',')}}`
+    return null
+  }
+  if (argument.kind === 'legacy') {
+    if (value != '' && /,/.test(value) && !/^"[\s\S]*"$/.test(value)) return ', argument="' + value + '"'
+    return value != '' ? ', argument=' + value : ''
+  }
+  return ', argument=' + JSON.stringify(`${value ?? ''}`)
 }
 
 function parseLoonScriptOptions(text) {
@@ -2267,18 +2371,20 @@ function parseLoonRewriteV2Action(text, condition) {
 
 function splitLoonV2Args(text) {
   const result = []
-  let start = 0, quote = '', escaped = false, depth = 0
+  let start = 0, quote = '', escaped = false, depth = 0, braceDepth = 0
   for (let i = 0; i < text.length; i++) {
     const ch = text[i]
     if (escaped) { escaped = false; continue }
-    if (ch === '\\' && quote) { escaped = true; continue }
+    if (ch === '\\' && quote && quote !== '`') { escaped = true; continue }
     if (quote) { if (ch === quote) quote = ''; continue }
-    if (ch === '"' || ch === "'") { quote = ch; continue }
+    if (ch === '"' || ch === "'" || ch === '`') { quote = ch; continue }
     if (ch === '(') depth++
     else if (ch === ')') depth--
-    else if (ch === ',' && depth === 0) { result.push(text.slice(start, i).trim()); start = i + 1 }
+    else if (ch === '{') braceDepth++
+    else if (ch === '}') braceDepth--
+    else if (ch === ',' && depth === 0 && braceDepth === 0) { result.push(text.slice(start, i).trim()); start = i + 1 }
   }
-  if (quote || depth !== 0) return null
+  if (quote || depth !== 0 || braceDepth !== 0) return null
   result.push(text.slice(start).trim())
   return result
 }
