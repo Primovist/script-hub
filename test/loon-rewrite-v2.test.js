@@ -3,7 +3,7 @@ const fs = require('fs')
 const vm = require('vm')
 
 const source = fs.readFileSync('Rewrite-Parser.js', 'utf8')
-const start = source.indexOf('// Loon Rewrite V2 parser.')
+const start = source.indexOf('function isLoonScriptV2Statement')
 const end = source.indexOf('//reject\n', start)
 assert(start >= 0 && end > start, 'V2 parser block not found')
 const context = {}
@@ -28,16 +28,39 @@ const redirect = parse('request if ${url} ~= /old\\/path/ then redirect(302, "ht
 assert.strictEqual(redirect.action.url, 'https://example.com/a,b?x=1')
 assert.strictEqual(redirect.action.status, 302)
 
-for (const status of ['403', '451']) {
-  assert.strictEqual(parse(`request if \${url} ~= /api/ then reject(${status})`).ok, false)
+for (const rule of [
+  'request if ${url} ~= /api/ then reject(403)',
+  'request if ${url} ~= /api/ then reject(451)',
+  'request if ${url} ~= /api/ then reject_dict(201)',
+  'request if ${url} ~= /api/ then reject(200, "Forbidden")',
+]) {
+  const parsed = parse(rule)
+  assert.strictEqual(parsed.ok, true)
+  assert.strictEqual(context.loonRewriteV2ToLegacy(parsed), null)
 }
-assert.strictEqual(parse('request if ${url} ~= /api/ then reject_dict(201)').ok, false)
-assert.strictEqual(parse('request if ${url} ~= /api/ then reject(403, "Forbidden")').ok, false)
 
 assert.strictEqual(parse('request if ${url} ~= /api/ && ${request.method} == "POST" then reject_dict(200)').ok, false)
-assert.strictEqual(parse('request if ${url} ~= /old/ as urlMatch then url.replace("https://new.example.com${urlMatch.1}")').ok, false)
+const capture = parse('request if ${url} ~= /^https:\\/\\/old\\.example\\.com(\\/.*)$/ as urlMatch then url.replace("https://new.example.com${urlMatch.1}")')
+assert.strictEqual(capture.ok, true)
+assert.strictEqual(context.loonRewriteV2ToLegacy(capture).rwvalue, 'https://new.example.com$1')
 assert.strictEqual(parse('request if ${url} ~= /api/ then unknown_action(200)').ok, false)
 assert.strictEqual(parse('# request if ${url} ~= /api/ then reject_dict(200)').ok, false)
+assert.strictEqual(parse("request if ${url} ~= /api/ then redirect(302, 'https://example.com')").ok, false)
+assert.strictEqual(parse('request if ${url} ~= /api/ then redirect(302, "https://${region}")').ok, false)
+const responseReject = parse('response if ${url} ~= /api/ then reject_dict(200)')
+assert.strictEqual(responseReject.ok, true)
+assert.strictEqual(context.loonRewriteV2ToLegacy(responseReject), null)
+
+const parseScript = context.parseLoonScriptV2
+const requestScript = parseScript('request if ${url} ~= /^https:\\/\\/api\\.example\\.com/i then script("https://example.com/request.js", "a=1,b=2") with tag="Request", timeout=20, requires_body=true')
+assert.strictEqual(requestScript.jstype, 'http-request')
+assert.strictEqual(requestScript.jsarg, 'a=1,b=2')
+assert.strictEqual(requestScript.rebody, 'true')
+assert.strictEqual(parseScript('request if ${url} ~= /api/ && ${request.method} == "POST" then script("request.js")'), null)
+assert.strictEqual(parseScript('request if ${url} ~= /api/ then script("request.js") with debug=true'), null)
+assert.strictEqual(parseScript('cron "0 8 * * *" then script("cron.js") with timeout=300').jstype, 'cron')
+assert.strictEqual(parseScript('network-changed then script("network.js")').jstype, 'network-changed')
+assert.strictEqual(parseScript('generic then script("tool.js", "region=CN") with tag="Tool"').jstype, 'generic')
 
 // The production gate is section-scoped: a Script section must not dispatch V2.
 let section = 'Script'
