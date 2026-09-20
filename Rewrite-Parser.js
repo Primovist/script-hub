@@ -166,6 +166,7 @@ let name,
   proto,
   engine,
   jsenable,
+  jsdebug,
   jsptn,
   jsarg,
   rebody,
@@ -407,7 +408,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
       const v2 = parseLoonScriptV2(x, sgArg)
       if (v2) {
         mark = getMark(y, body)
-        jsBox.push({ mark, noteK: false, ...v2, ori: _x, num: y })
+        jsBox.push({ mark, noteK: v2.disabledByDefault, ...v2, ori: _x, num: y })
         loonScriptV2Stats.convertedV2Count++
       } else {
         otherRule.push(`[Unsupported Loon Script V2]\n${_x}`)
@@ -418,11 +419,11 @@ if (binaryInfo != null && binaryInfo.length > 0) {
 
     if (fromType === 'loon-plugin' && loonRewriteV2Section && /^(?:request|response)\s+if\b/i.test(x)) {
       loonV2Stats.detectedV2Count++
-      const v2 = parseLoonRewriteV2(x)
+      const v2 = parseLoonRewriteV2(x, sgArg)
       const legacy = v2.ok ? loonRewriteV2ToLegacy(v2) : null
       if (legacy) {
         mark = getMark(y, body)
-        rwBox.push({ mark, noteK: false, ...legacy })
+        rwBox.push({ mark, noteK: v2.condition.disabledByDefault, ...legacy })
         loonV2Stats.convertedV2Count++
       } else {
         otherRule.push(`[Unsupported Loon Rewrite V2]\n${_x}`)
@@ -882,6 +883,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
       ability = getJsInfo(x, /[=,\s]\s*ability\s*=\s*/)
       engine = getJsInfo(x, /[=,\s]\s*engine\s*=\s*/)
       jsenable = getJsInfo(x, /[=,\s]\s*enable\s*=\s*/)
+      jsdebug = getJsInfo(x, /[=,\s]\s*debug\s*=\s*/)
       updatetime = getJsInfo(x, /[=,\s]\s*script-update-interval\s*=\s*/)
       timeout = getJsInfo(x, /[=,\s]\s*timeout\s*=\s*/)
       tilesicon = jstype == 'generic' && /icon=/.test(x) ? x.split('icon=')[1].split('&')[0] : ''
@@ -905,6 +907,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
               jsarg: '',
               rebody: '',
               jsenable,
+              jsdebug,
               ori: x,
               num: y,
             })
@@ -938,6 +941,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
           eventname,
           engine,
           jsenable,
+          jsdebug,
           ori: x,
           num: y,
         })
@@ -1541,6 +1545,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
       proto = jsBox[i].proto ? istrue(jsBox[i].proto) : ''
       engine = jsBox[i].engine ? jsBox[i].engine : ''
       jsenable = jsBox[i].jsenable ? jsBox[i].jsenable : ''
+      jsdebug = jsBox[i].jsdebug ? jsBox[i].jsdebug : ''
       size = jsBox[i].size ? jsBox[i].size : ''
       ability = jsBox[i].ability ? ', ability=' + jsBox[i].ability : ''
       updatetime = jsBox[i].updatetime ? ', script-update-interval=' + jsBox[i].updatetime : ''
@@ -1578,6 +1583,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
           timeout = timeout ? ', timeout=' + timeout : ''
           engine = engine && isSurgeiOS ? ', engine=' + engine : ''
           jsenable = jsenable && isLooniOS ? ', enable=' + jsenable : ''
+          jsdebug = jsdebug && isLooniOS ? ', debug=' + jsdebug : ''
           jsarg = formatScriptArgument(jsarg, scriptArgument, targetApp)
           if (jsarg == null) {
             otherRule.push(ori)
@@ -1602,6 +1608,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
                     ', tag=' +
                     jsname +
                     jsenable +
+                    jsdebug +
                     img +
                     jsarg
                 )
@@ -1672,6 +1679,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
                 ', tag=' +
                 jsname +
                 jsenable +
+                jsdebug +
                 img +
                 jsarg
             )
@@ -2090,21 +2098,193 @@ async function getIcon(icon) {
   return 'icon not found'
 }
 
+function getLoonArgumentDefault(item) {
+  if (!item?.key) return null
+  const values = splitLoonV2Args(`${item.value ?? ''}`)
+  const raw = values?.[0]?.trim() ?? ''
+  const numberType = /(?:^|,)\s*type\s*=\s*number(?:\s*,|$)/i.test(`${item.tag ?? ''}`)
+  if (item.type === 'switch') {
+    if (!/^(?:true|false)$/i.test(raw)) return { key: item.key, hasDefault: false, type: 'boolean', value: null }
+    return { key: item.key, hasDefault: true, type: 'boolean', value: /^true$/i.test(raw) }
+  }
+  if (!raw || raw === '--') return { key: item.key, hasDefault: false, type: numberType ? 'number' : 'string', value: null }
+  const stringValue = parseLoonV2String(raw)
+  const value = stringValue == null ? raw.replace(/^'([\s\S]*)'$/, '$1') : stringValue
+  if (numberType) {
+    const number = Number(value)
+    return { key: item.key, hasDefault: Number.isFinite(number), type: 'number', value: number }
+  }
+  return { key: item.key, hasDefault: true, type: 'string', value }
+}
+
+function getLoonArgumentDefaultMap(declaredArguments) {
+  const result = new Map()
+  if (!Array.isArray(declaredArguments)) return result
+  declaredArguments.forEach(item => {
+    const value = getLoonArgumentDefault(item)
+    if (value) result.set(value.key, value)
+  })
+  return result
+}
+
+function resolveLoonArgumentDefaults(text, declaredArguments) {
+  const defaults = getLoonArgumentDefaultMap(declaredArguments)
+  if (defaults.size === 0) return { ok: true, value: text, used: [] }
+  let result = '', quote = '', escaped = false, regex = false, inClass = false
+  const used = []
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (escaped) { result += ch; escaped = false; continue }
+    if (quote === '`') {
+      result += ch
+      if (ch === '`') quote = ''
+      continue
+    }
+    if (regex) {
+      result += ch
+      if (ch === '\\') { escaped = true; continue }
+      if (ch === '[') inClass = true
+      else if (ch === ']' && inClass) inClass = false
+      else if (ch === '/' && !inClass) regex = false
+      continue
+    }
+    if (ch === '\\' && quote === '"') { result += ch; escaped = true; continue }
+    if (ch === '"') { quote = quote ? '' : '"'; result += ch; continue }
+    if (!quote && ch === '`') { quote = '`'; result += ch; continue }
+    if (!quote && ch === '/' && /(?:^|[=~,(\[]\s*)$/.test(result)) { regex = true; result += ch; continue }
+    if (ch === '$' && text[i + 1] === '{') {
+      const end = text.indexOf('}', i + 2)
+      const name = end < 0 ? '' : text.slice(i + 2, end)
+      const item = defaults.get(name)
+      if (item) {
+        if (!item.hasDefault) return { ok: false, reason: `missing default: ${name}` }
+        used.push(name)
+        if (quote === '"') result += JSON.stringify(String(item.value)).slice(1, -1)
+        else if (item.type === 'string' && /~=\s*$/.test(result) && parseLoonRegexLiteral(item.value)) result += item.value
+        else result += item.type === 'string' ? JSON.stringify(item.value) : String(item.value)
+        i = end
+        continue
+      }
+    }
+    result += ch
+  }
+  return quote || regex ? { ok: false, reason: 'unterminated literal' } : { ok: true, value: result, used }
+}
+
+function parseLoonStaticLiteral(text) {
+  const value = text.trim()
+  if (/^(?:true|false|null)$/.test(value)) return { ok: true, value: value === 'true' ? true : value === 'false' ? false : null }
+  if (/^-?(?:\d+\.?\d*|\.\d+)$/.test(value)) return { ok: true, value: Number(value) }
+  const string = parseLoonV2String(value)
+  return string == null ? { ok: false } : { ok: true, value: string }
+}
+
+function evaluateLoonStaticComparison(text) {
+  const match = text.trim().match(/^([\s\S]+?)\s*==\s*([\s\S]+)$/)
+  if (!match) return null
+  const left = parseLoonStaticLiteral(match[1])
+  const right = parseLoonStaticLiteral(match[2])
+  return left.ok && right.ok ? left.value === right.value : null
+}
+
+function splitLoonTopLevelOperator(text, operator) {
+  const parts = []
+  let start = 0, quote = '', escaped = false, regex = false, inClass = false, depth = 0
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (escaped) { escaped = false; continue }
+    if (quote) {
+      if (ch === '\\' && quote !== '`') escaped = true
+      else if (ch === quote) quote = ''
+      continue
+    }
+    if (regex) {
+      if (ch === '\\') escaped = true
+      else if (ch === '[') inClass = true
+      else if (ch === ']' && inClass) inClass = false
+      else if (ch === '/' && !inClass) regex = false
+      continue
+    }
+    if (ch === '"' || ch === '`') { quote = ch; continue }
+    if (ch === '/' && /(?:^|[=~,(\[]\s*)$/.test(text.slice(0, i))) { regex = true; continue }
+    if (ch === '(') depth++
+    else if (ch === ')') depth--
+    else if (depth === 0 && text.slice(i, i + operator.length) === operator) {
+      parts.push(text.slice(start, i).trim()); start = i + operator.length; i += operator.length - 1
+    }
+  }
+  parts.push(text.slice(start).trim())
+  return parts
+}
+
+function stripLoonOuterParens(text) {
+  let value = text.trim()
+  while (value[0] === '(' && value[value.length - 1] === ')') {
+    let depth = 0, wraps = true
+    for (let i = 0; i < value.length; i++) {
+      if (value[i] === '(') depth++
+      else if (value[i] === ')' && --depth === 0 && i !== value.length - 1) { wraps = false; break }
+    }
+    if (!wraps || depth !== 0) break
+    value = value.slice(1, -1).trim()
+  }
+  return value
+}
+
+function evaluateLoonStaticExpression(text) {
+  const value = stripLoonOuterParens(text)
+  const orParts = splitLoonTopLevelOperator(value, '||')
+  if (orParts.length > 1) {
+    const results = orParts.map(evaluateLoonStaticExpression)
+    return results.some(item => item == null) ? null : results.some(Boolean)
+  }
+  const andParts = splitLoonTopLevelOperator(value, '&&')
+  if (andParts.length > 1) {
+    const results = andParts.map(evaluateLoonStaticExpression)
+    return results.some(item => item == null) ? null : results.every(Boolean)
+  }
+  if (/^(?:true|false)$/.test(value)) return value === 'true'
+  return evaluateLoonStaticComparison(value)
+}
+
+function parseLoonV2ConditionWithDefaults(text, declaredArguments) {
+  const resolved = resolveLoonArgumentDefaults(text, declaredArguments)
+  if (!resolved.ok) return null
+  const direct = parseLoonRewriteV2Condition(resolved.value)
+  if (direct) return direct
+  const terms = splitLoonTopLevelOperator(resolved.value, '&&')
+  if (terms.length < 2) return null
+  let urlCondition = null, disabledByDefault = false
+  for (const term of terms) {
+    const value = stripLoonOuterParens(term)
+    const url = parseLoonRewriteV2Condition(value)
+    if (url) {
+      if (urlCondition) return null
+      urlCondition = url
+      continue
+    }
+    const evaluated = evaluateLoonStaticExpression(value)
+    if (evaluated == null) return null
+    if (!evaluated) disabledByDefault = true
+  }
+  return urlCondition && { ...urlCondition, disabledByDefault }
+}
+
 function isLoonScriptV2Statement(line) {
   return /^(?:request|response)\s+if\b/i.test(line) ||
     /^(?:cron\s+.+|network-changed|generic)\s+then\s+script\s*\(/i.test(line)
 }
 
 function parseLoonScriptV2(line, declaredArguments) {
-  let jstype, jsptn = '', cronexp = '', rest
+  let jstype, jsptn = '', cronexp = '', rest, condition = null
   const http = line.match(/^\s*(request|response)\s+if\s+/i)
   if (http) {
     jstype = `http-${http[1].toLowerCase()}`
     rest = line.slice(http[0].length)
     const separators = [...rest.matchAll(/\s+then\s+/gi)]
-    let condition = null, actionText = ''
+    let actionText = ''
     for (const separator of separators) {
-      condition = parseLoonRewriteV2Condition(rest.slice(0, separator.index).trim())
+      condition = parseLoonV2ConditionWithDefaults(rest.slice(0, separator.index).trim(), declaredArguments)
       if (condition && !condition.captureName) {
         actionText = rest.slice(separator.index + separator[0].length).trim()
         break
@@ -2114,10 +2294,11 @@ function parseLoonScriptV2(line, declaredArguments) {
     jsptn = loonV2RegexForLegacy(condition.pattern, condition.flags)
     rest = actionText
   } else {
-    const cron = line.match(/^\s*cron\s+("(?:[^"\\]|\\.)*")\s+then\s+/i)
+    const cron = line.match(/^\s*cron\s+([\s\S]+?)\s+then\s+/i)
     if (cron) {
       jstype = 'cron'
-      cronexp = parseLoonV2String(cron[1])
+      const resolvedCron = resolveLoonArgumentDefaults(cron[1], declaredArguments)
+      cronexp = resolvedCron.ok ? parseLoonV2String(resolvedCron.value) : null
       if (!cronexp) return null
       rest = line.slice(cron[0].length)
     } else {
@@ -2130,7 +2311,7 @@ function parseLoonScriptV2(line, declaredArguments) {
 
   const split = splitLoonScriptWith(rest)
   const call = split && parseLoonScriptCall(split.action, declaredArguments)
-  const options = split && parseLoonScriptOptions(split.options)
+  const options = split && parseLoonScriptOptions(split.options, declaredArguments, jstype)
   if (!call || !options) return null
   const jsname = options.tag || call.path.substring(call.path.lastIndexOf('/') + 1).replace(/\.js(?:\?.*)?$/, '')
   return {
@@ -2147,6 +2328,9 @@ function parseLoonScriptV2(line, declaredArguments) {
     timeout: options.timeout ? String(options.timeout) : '',
     rebody: options.requires_body ? 'true' : '',
     proto: options.binary_body_mode ? 'true' : '',
+    jsenable: Object.prototype.hasOwnProperty.call(options, 'enable') ? String(options.enable) : '',
+    jsdebug: Object.prototype.hasOwnProperty.call(options, 'debug') ? String(options.debug) : '',
+    disabledByDefault: condition?.disabledByDefault || options.enable === false,
   }
 }
 
@@ -2175,7 +2359,7 @@ function parseLoonScriptCall(text, declaredArguments) {
   if (!args || args.length < 1 || args.length > 2) return null
   const path = parseLoonV2String(args[0])
   const argument = parseLoonScriptArgument(args.length === 2 ? args[1] : undefined, declaredArguments)
-  if (!path || /\$\{[^}]+\}/.test(path) || !argument) return null
+  if (!path || /\$\{[^}]+\}/.test(path) || /^\[[^\]]+\]\([^)]+\)$/.test(path) || /[\r\n]/.test(path) || !argument) return null
   return { path, argument }
 }
 
@@ -2184,8 +2368,11 @@ function parseLoonScriptArgument(text, declaredArguments) {
   const source = text.trim()
   const stringValue = parseLoonV2String(source)
   if (stringValue != null) {
-    if (/\$\{[^}]+\}/.test(stringValue)) return null
-    return { present: true, kind: 'string', value: stringValue, keys: [] }
+    const resolved = resolveLoonArgumentDefaults(source, declaredArguments)
+    if (!resolved.ok) return null
+    const value = parseLoonV2String(resolved.value)
+    if (value == null || /\$\{[^}]+\}/.test(value)) return null
+    return { present: true, kind: 'string', value, keys: [] }
   }
   if (/^`[^`]*`$/.test(source)) {
     return { present: true, kind: 'string', value: source.slice(1, -1), keys: [], raw: true }
@@ -2258,7 +2445,7 @@ function formatScriptArgument(value, argument, outputTarget) {
   return ', argument=' + JSON.stringify(`${value ?? ''}`)
 }
 
-function parseLoonScriptOptions(text) {
+function parseLoonScriptOptions(text, declaredArguments, jstype) {
   const result = {}
   if (!text) return result
   const entries = splitLoonV2Args(text)
@@ -2267,18 +2454,31 @@ function parseLoonScriptOptions(text) {
     const match = entry.match(/^([a-z_]+)\s*=\s*([\s\S]+)$/)
     if (!match || Object.prototype.hasOwnProperty.call(result, match[1])) return null
     const key = match[1]
-    const value = match[2].trim()
+    let value = match[2].trim()
     if (['tag', 'img_url'].includes(key)) {
       result[key] = parseLoonV2String(value)
       if (result[key] == null || /\$\{[^}]+\}/.test(result[key])) return null
     } else if (key === 'timeout') {
+      const dynamic = value.match(/^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/)
+      if (dynamic) {
+        const item = getLoonArgumentDefaultMap(declaredArguments).get(dynamic[1])
+        if (!item || !['number', 'string'].includes(item.type)) return null
+        value = item.hasDefault ? String(item.value) : /http-(?:request|response)/.test(jstype) ? '20' : '300'
+      }
       result[key] = Number(value)
       if (!Number.isFinite(result[key]) || result[key] <= 0) return null
     } else if (['requires_body', 'binary_body_mode'].includes(key)) {
       if (!/^(?:true|false)$/.test(value)) return null
       result[key] = value === 'true'
     } else if (key === 'enable' || key === 'debug') {
-      if (value !== (key === 'enable' ? 'true' : 'false')) return null
+      const dynamic = value.match(/^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/)
+      if (dynamic) {
+        const item = getLoonArgumentDefaultMap(declaredArguments).get(dynamic[1])
+        if (!item || item.type !== 'boolean') return null
+        value = item.hasDefault ? String(item.value) : key === 'enable' ? 'true' : 'false'
+      }
+      if (!/^(?:true|false)$/.test(value)) return null
+      result[key] = value === 'true'
     } else return null
   }
   return result
@@ -2287,7 +2487,7 @@ function parseLoonScriptOptions(text) {
 // Loon Rewrite V2 parser.  This intentionally parses delimiters while aware of
 // regex literals, quoted strings and nested parentheses; split('/')/(',') is
 // not safe for this syntax.
-function parseLoonRewriteV2(line) {
+function parseLoonRewriteV2(line, declaredArguments) {
   const fail = reason => ({ ok: false, reason, raw: line })
   const prefix = line.match(/^\s*(request|response)\s+if\s+/i)
   if (!prefix) return fail('invalid statement')
@@ -2295,8 +2495,9 @@ function parseLoonRewriteV2(line) {
   const rest = line.slice(prefix[0].length)
   const separators = [...rest.matchAll(/\s+then\s+/gi)]
   for (const separator of separators) {
-    const condition = parseLoonRewriteV2Condition(rest.slice(0, separator.index).trim())
-    const action = parseLoonRewriteV2Action(rest.slice(separator.index + separator[0].length).trim(), condition)
+    const condition = parseLoonV2ConditionWithDefaults(rest.slice(0, separator.index).trim(), declaredArguments)
+    const resolvedAction = resolveLoonArgumentDefaults(rest.slice(separator.index + separator[0].length).trim(), declaredArguments)
+    const action = condition && resolvedAction.ok ? parseLoonRewriteV2Action(resolvedAction.value, condition) : null
     if (condition && action) return { ok: true, version: 2, phase, condition, action, raw: line }
   }
   return fail('unsupported condition or action')

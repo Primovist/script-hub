@@ -3,7 +3,7 @@ const fs = require('fs')
 const vm = require('vm')
 
 const source = fs.readFileSync('Rewrite-Parser.js', 'utf8')
-const start = source.indexOf('function isLoonScriptV2Statement')
+const start = source.indexOf('function getLoonArgumentDefault')
 const end = source.indexOf('//reject\n', start)
 assert(start >= 0 && end > start, 'V2 parser block not found')
 const context = {}
@@ -59,7 +59,7 @@ assert.strictEqual(requestScript.jsargPresent, true)
 assert.strictEqual(requestScript.jsargKind, 'string')
 assert.strictEqual(requestScript.rebody, 'true')
 assert.strictEqual(parseScript('request if ${url} ~= /api/ && ${request.method} == "POST" then script("request.js")'), null)
-assert.strictEqual(parseScript('request if ${url} ~= /api/ then script("request.js") with debug=true'), null)
+assert.strictEqual(parseScript('request if ${url} ~= /api/ then script("request.js") with debug=true').jsdebug, 'true')
 assert.strictEqual(parseScript('cron "0 8 * * *" then script("cron.js") with timeout=300').jstype, 'cron')
 assert.strictEqual(parseScript('network-changed then script("network.js")').jstype, 'network-changed')
 assert.strictEqual(parseScript('generic then script("tool.js", "region=CN") with tag="Tool"').jstype, 'generic')
@@ -102,6 +102,56 @@ assert.strictEqual(legacyObject.kind, 'object')
 assert.deepStrictEqual(Array.from(legacyObject.keys), ['region', 'level'])
 assert.strictEqual(parseLegacyArgument('generic script-path=tool.js, argument={missing}', declaredArguments).kind, 'invalid')
 
+const defaultArguments = [
+  { key: 'enabled', type: 'switch', value: 'true', tag: 'tag=启用' },
+  { key: 'disabled', type: 'switch', value: 'false', tag: 'tag=禁用' },
+  { key: 'script_timeout', type: 'input', value: '"15"', tag: 'tag=超时' },
+  { key: 'missing_timeout', type: 'input', value: '', tag: 'tag=超时' },
+  { key: 'script_debug', type: 'switch', value: 'true', tag: 'tag=调试' },
+  { key: 'region', type: 'select', value: '"CN","US"', tag: 'tag=地区' },
+  { key: 'cron', type: 'input', value: '"0 8 * * *"', tag: 'tag=定时' },
+  { key: 'url_pattern', type: 'input', value: '"/api/i"', tag: 'tag=匹配' },
+  { key: 'status', type: 'input', value: '200', tag: 'type=number, tag=状态' },
+  { key: 'host', type: 'input', value: '"new.example.com"', tag: 'tag=主机' },
+]
+const dynamicOptions = parseScript('request if ${url} ~= /api/ then script("request.js") with enable=${enabled}, timeout=${script_timeout}, debug=${script_debug}', defaultArguments)
+assert.strictEqual(dynamicOptions.jsenable, 'true')
+assert.strictEqual(dynamicOptions.timeout, '15')
+assert.strictEqual(dynamicOptions.jsdebug, 'true')
+assert.strictEqual(dynamicOptions.disabledByDefault, false)
+const githubPushTimeRule = parseScript('request if ${url} ~= /^https?:\\/\\/api\\.github\\.com\\/graphql/i then script("https://raw.githubusercontent.com/TomCatXue/MyCookieCenter/refs/heads/main/scripts/tools/github/github_push_time.js?v=20260818-12") with enable=${enabled}, tag="GitHub 推送时间-查询增强", timeout=10, requires_body=true', defaultArguments)
+assert.strictEqual(githubPushTimeRule.jstype, 'http-request')
+assert.strictEqual(githubPushTimeRule.jsenable, 'true')
+assert.strictEqual(githubPushTimeRule.rebody, 'true')
+const disabledOption = parseScript('request if ${url} ~= /api/ then script("request.js") with enable=${disabled}', defaultArguments)
+assert.strictEqual(disabledOption.jsenable, 'false')
+assert.strictEqual(disabledOption.disabledByDefault, true)
+assert.strictEqual(parseScript('request if ${url} ~= /api/ then script("request.js") with timeout=${missing_timeout}', defaultArguments).timeout, '20')
+assert.strictEqual(parseScript('generic then script("tool.js") with timeout=${missing_timeout}', defaultArguments).timeout, '300')
+assert.strictEqual(parseScript('generic then script("tool.js") with timeout=${enabled}', defaultArguments), null)
+assert.strictEqual(parseScript('generic then script("tool.js", "region=${region}")', defaultArguments).jsarg, 'region=CN')
+assert.strictEqual(parseScript('cron ${cron} then script("cron.js")', defaultArguments).cronexp, '0 8 * * *')
+assert.strictEqual(parseScript('request if ${url} ~= ${url_pattern} then script("request.js")', defaultArguments).jsptn, '(?i)api')
+assert.strictEqual(parseScript('request if ${enabled} == true && ${url} ~= /api/ then script("request.js")', defaultArguments).disabledByDefault, false)
+assert.strictEqual(parseScript('request if ${disabled} == true && ${url} ~= /api/ then script("request.js")', defaultArguments).disabledByDefault, true)
+assert.strictEqual(parseScript('request if (${region} == "CN" || ${region} == "HK") && ${url} ~= /api/ then script("request.js")', defaultArguments).disabledByDefault, false)
+assert.strictEqual(parseScript('request if ${url} ~= /api/ then script("request.js") with enable=${region}', defaultArguments), null)
+assert.strictEqual(parseScript('request if ${url} ~= /api/ then script("request.js", "${unknown}")', defaultArguments), null)
+assert.strictEqual(parseScript('generic then script("[https://example.com/a.js](https://example.com/a.js)")', defaultArguments), null)
+assert.strictEqual(parseScript('generic then script("tool.js", `literal ${region}`)', defaultArguments).jsarg, 'literal ${region}')
+
+const dynamicReject = context.parseLoonRewriteV2('request if ${url} ~= /api/ then reject_dict(${status})', defaultArguments)
+assert.strictEqual(dynamicReject.ok, true)
+assert.strictEqual(dynamicReject.action.status, 200)
+const dynamicRedirect = context.parseLoonRewriteV2('request if ${enabled} == true && ${url} ~= /old/ then redirect(302, "https://${host}")', defaultArguments)
+assert.strictEqual(dynamicRedirect.ok, true)
+assert.strictEqual(dynamicRedirect.action.url, 'https://new.example.com')
+const dynamicRejectBody = context.parseLoonRewriteV2('request if ${url} ~= /api/ then reject(${status}, "region=${region}")', defaultArguments)
+assert.strictEqual(dynamicRejectBody.action.body, 'region=CN')
+const disabledRewrite = context.parseLoonRewriteV2('request if ${disabled} == true && ${url} ~= /api/ then reject_dict(${status})', defaultArguments)
+assert.strictEqual(disabledRewrite.ok, true)
+assert.strictEqual(disabledRewrite.condition.disabledByDefault, true)
+
 // The production gate is section-scoped: a Script section must not dispatch V2.
 let section = 'Script'
 let dispatched = 0
@@ -113,7 +163,7 @@ assert.strictEqual(dispatched, 1)
 
 // Stable and beta parsers must accept the same Script argument grammar.
 const betaSource = fs.readFileSync('Rewrite-Parser.beta.js', 'utf8')
-const betaStart = betaSource.indexOf('function isLoonScriptV2Statement')
+const betaStart = betaSource.indexOf('function getLoonArgumentDefault')
 const betaEnd = betaSource.indexOf('//reject\n', betaStart)
 assert(betaStart >= 0 && betaEnd > betaStart, 'beta V2 parser block not found')
 const betaContext = {}
@@ -124,6 +174,12 @@ assert.strictEqual(betaRaw.jsargPresent, true)
 const betaObject = betaContext.parseLoonScriptV2('generic then script("plugin.js", {${region}, ${enabled}})', declaredArguments)
 assert.deepStrictEqual(Array.from(betaObject.jsargKeys), ['region', 'enabled'])
 assert.strictEqual(betaContext.parseLoonLegacyScriptArgument('generic script-path=tool.js, argument="", tag=Tool').present, true)
+const betaDynamic = betaContext.parseLoonScriptV2('request if ${enabled} == true && ${url} ~= ${url_pattern} then script("request.js", "region=${region}") with enable=${enabled}, timeout=${script_timeout}, debug=${script_debug}', defaultArguments)
+assert.strictEqual(betaDynamic.jsptn, '(?i)api')
+assert.strictEqual(betaDynamic.jsarg, 'region=CN')
+assert.strictEqual(betaDynamic.timeout, '15')
+assert.strictEqual(betaDynamic.jsdebug, 'true')
+assert.strictEqual(betaContext.parseLoonRewriteV2('request if ${url} ~= /api/ then reject_dict(${status})', defaultArguments).action.status, 200)
 
 const betaArgumentHelpersStart = betaSource.indexOf('function stripWrapQuote')
 const betaArgumentHelpersEnd = betaSource.indexOf('function parseQueryString', betaArgumentHelpersStart)
