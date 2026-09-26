@@ -1,0 +1,33 @@
+#!name=Loon V2 conversion fixture
+
+[Rule]
+DOMAIN,REJECT.example.com,REJECT
+AND,((DOMAIN,api.example.com),(PROTOCOL,TCP))
+FINAL,DIRECT
+
+[Rewrite]
+request if ${url} ~= /^https:\/\/api\.example\.com\/ads/ then reject_video(200)
+response if ${url} ~= /profile\/(\d+)/ as profile then response.header.set("X-ID", "${profile.1}") | response.json.delete(["ad", "tracking"])
+response if ${url} ~= /profile/ && ${response.status} == 200 then response.json.replace("price", ${price})
+response if ${url} ~= /mock/ then response.body.mock("json", `{"code":0,"message":"ok"}`, 201) | response.header.set("X-Mock", "yes")
+response if ${url} ~= /avatar/ then response.body.mock_file("png", "https://example.com/icon.base64", 200, true)
+response if ${url} ~= /jq/ then response.json.delete("ad") | response.json.jq(".items |= map(select(.ad != true))")
+
+[Script]
+request if ${url} ~= /order/ && ${request.method} == "POST" then script("https://example.com/order.js", {${region}, ${enabled}}) with timeout=10, requires_body=true
+request if ${url} ~= /order/ then script("https://example.com/fallback.js", "fallback")
+response if (${url} ~= /v1/ || ${url} ~= /v2/) && ${response.status} == 200 then script("https://example.com/response.js") with requires_body=true
+cron ${cron} then script("https://example.com/daily.js", {${region}}) with timeout=300
+generic then script("https://example.com/tool.js", `first line
+second line
+`) with tag="Manual"
+network-changed then script("https://example.com/network.js", "region=${region}")
+
+[Argument]
+region = select,"CN","US",tag=Region
+enabled = switch,true,tag=Enabled
+price = input,9.99,type=number,tag=Price
+cron = input,"0 8 * * *",tag=Schedule
+
+[MITM]
+hostname = api.example.com

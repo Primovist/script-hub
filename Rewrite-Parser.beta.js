@@ -252,6 +252,9 @@ let rwbodyBox = [] // Body Rewrite
 let panelBox = [] //Panel信息
 let jsBox = [] //脚本
 let mockBox = [] //MapLocal或echo-response
+let loonLiteralPrefix = '__SCRIPT_HUB_LOON_LITERAL_'
+let loonLiteralValues = []
+let loonActiveSection = ''
 let loonRewriteV2Section = false
 let loonV2Stats = { detectedV2Count: 0, convertedV2Count: 0, unsupportedV2Count: 0 }
 let loonScriptV2Section = false
@@ -340,6 +343,8 @@ if (binaryInfo != null && binaryInfo.length > 0) {
   eval(evJsori)
   eval(evUrlori)
 
+  while (body.includes(loonLiteralPrefix) || JSON.stringify(queryObject).includes(loonLiteralPrefix)) loonLiteralPrefix += '_'
+
   // [Body Rewrite] 部分 rwbodyBox
   let bodyRewrite = body.match(/(^|\n)\[Body Rewrite\]\n([\s\S]*?)\s*(\n\[|$)/)?.[2]
 
@@ -351,7 +356,16 @@ if (binaryInfo != null && binaryInfo.length > 0) {
     }
   }
 
-  body = body.match(/[^\r\n]+/g)
+  body = fromType === 'loon-plugin' ? splitLoonConfigLines(body) : body.match(/[^\r\n]+/g) || []
+  // Bind declarations before parsing consumers, regardless of section order.
+  if (fromType === 'loon-plugin') {
+    let section = ''
+    for (const raw of body) {
+      const line = stripLoonComment(raw.trim())
+      if (/^\[[^\]]+\]$/.test(line)) section = line.toLowerCase()
+      else if (section === '[argument]' && /^[^#;].*?=\s*(?:input|select|switch)\s*,/.test(line)) parseArguments(line)
+    }
+  }
 
   for await (let [y, x] of body.entries()) {
     // 保持原始 x
@@ -361,15 +375,15 @@ if (binaryInfo != null && binaryInfo.length > 0) {
       .trim()
       .replace(/^(#|;|\/\/)\s*/, '#')
       .replace(/\s+[^\s]+\s+url-and-header\s+/, ' url ')
-      .replace(/(^[^#].+)\x20+\/\/.+/, '$1')
       .replace(/^#!PROFILE-VERSION-REQUIRED\s+[0-9]+\s+/i, '')
       .replace(/^(#)?host(-suffix|-keyword|-wildcard)?\s*,\s*/i, '$1DOMAIN$2,')
       .replace(/^(#)?ip6-cidr\s*,\s*/i, '$1IP-CIDR6,')
     if (!/^(#|\/\/|;)/.test(x)) {
-      x = x.replace(/\s+?(?:#|\/\/|;).*?$/, '')
+      x = fromType === 'loon-plugin' ? stripLoonComment(x) : x.replace(/\s+?(?:#|\/\/|;).*?$/, '')
     }
     // Loon Rewrite V2 只在 [Rewrite] 段落中识别，避免把脚本里的 if 当成重写。
     if (fromType === 'loon-plugin' && /^\[[^\]]+\]$/.test(x)) {
+      loonActiveSection = x.toLowerCase()
       loonRewriteV2Section = /^\[Rewrite\]$/i.test(x)
       loonScriptV2Section = /^\[(?:Script|Remote Script)\]$/i.test(x)
     }
@@ -408,6 +422,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
 
     if (fromType === 'loon-plugin' && loonScriptV2Section && isLoonScriptV2Statement(x)) {
       loonScriptV2Stats.detectedV2Count++
+      if (isLooniOS) { script.push(protectLoonOutputLiteral(bindLoonResourceReferences(x, reqArr.length === 1 ? reqArr[0] : ''))); continue }
       const v2 = parseLoonScriptV2(x, sgArg)
       if (v2) {
         mark = getMark(y, body)
@@ -422,19 +437,46 @@ if (binaryInfo != null && binaryInfo.length > 0) {
 
     if (fromType === 'loon-plugin' && loonRewriteV2Section && /^(?:request|response)\s+if\b/i.test(x)) {
       loonV2Stats.detectedV2Count++
+      if (isLooniOS) { URLRewrite.push(protectLoonOutputLiteral(bindLoonResourceReferences(x, reqArr.length === 1 ? reqArr[0] : ''))); continue }
       const v2 = parseLoonRewriteV2(x, sgArg)
       const legacy = v2.ok ? loonRewriteV2ToLegacy(v2) : null
-      if (legacy) {
+      if (legacy && !parseLoonExtendedRewrite(x, sgArg)) {
         mark = getMark(y, body)
         rwBox.push({ mark, noteK: v2.condition.disabledByDefault, ...legacy })
         loonV2Stats.convertedV2Count++
       } else {
-        otherRule.push(`[Unsupported Loon Rewrite V2]\n${_x}`)
+        const extended = parseLoonExtendedRewrite(x, sgArg)
+        if (extended) {
+          extended.resourceBase = reqArr.length === 1 ? reqArr[0] : ''
+          try { await resolveLoonJQFiles(extended, extended.resourceBase, path => http(path, reqHeaders)) }
+          catch (error) {
+            otherRule.push(`[Loon resource error: ${error.message}]\n${_x}`)
+            loonV2Stats.unsupportedV2Count++
+            continue
+          }
+        }
+        const converted = (extended && loonExtendedRewriteScript(extended, _x, y)) || loonRejectScript(v2, _x, y)
+        if (converted) {
+          jsBox.push(converted)
+          loonV2Stats.convertedV2Count++
+          continue
+        }
+        const jqProgram = extended && isSurgeiOS ? loonNativeJQProgram(extended) : null
+        if (jqProgram != null) {
+          BodyRewrite.push(protectLoonOutputLiteral(`${extended.condition.disabledByDefault ? '#' : ''}http-${extended.phase}-jq ${loonV2RegexForLegacy(extended.condition.pattern, extended.condition.flags)} ${JSON.stringify(jqProgram)}`))
+          loonV2Stats.convertedV2Count++
+          continue
+        }
+        const reason = extended?.actions.some(action => /^json\.jq/.test(action.name))
+          ? `${targetApp}: jq requires native execution; this condition/action combination cannot use the native JSON-only path`
+          : 'invalid or unsupported condition, value type, regex or action'
+        otherRule.push(`[Unsupported Loon Rewrite V2: ${reason}]\n${_x}`)
         loonV2Stats.unsupportedV2Count++
       }
       continue
     }
 
+    const loonCountBefore = ruleBox.length + rwBox.length + jsBox.length + mockBox.length + rwhdBox.length + rwbodyBox.length + URLRewrite.length + otherRule.length
     let flags = {}
     //sni嗅探
     if (sni != null) {
@@ -578,7 +620,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
 
     //#!arguments参数
     if (/^#!arguments\s*=\s*.+/.test(x) || /^[^#].+?=\s*(input|select|switch)\s*,/.test(x)) {
-      parseArguments(x)
+      if (fromType !== 'loon-plugin' || /^#!arguments/.test(x)) parseArguments(x)
     }
 
     //hostname
@@ -786,7 +828,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
 
     //rule解析
     if (
-      /^(#|\/\/|;)?\s*?(domain|domain-suffix|domain-keyword|domain-set|domain-wildcard|ip-cidr|ip-cidr6|geoip|ip-asn|rule-set|url-regex|user-agent|process-name|subnet|dest-port|dst-port|in-port|src-port|src-ip|protocol|network|script|hostname-type|cellular-radio|device-name|domain-regex|geosite|ip-suffix|src-geoip|src-ip-asn|src-ip-cidr|src-ip-suffix|in-type|in-user|in-name|process-path|process-path-regex|process-name-regex|uid|dscp|sub-rule|match|and|or|not)\s*?,.+/i.test(
+      /^(#|\/\/|;)?\s*?(domain|domain-suffix|domain-keyword|domain-set|domain-wildcard|ip-cidr|ip-cidr6|geoip|ip-asn|rule-set|url-regex|user-agent|process-name|subnet|dest-port|dst-port|in-port|src-port|src-ip|protocol|network|script|hostname-type|cellular-radio|device-name|domain-regex|geosite|ip-suffix|src-geoip|src-ip-asn|src-ip-cidr|src-ip-suffix|in-type|in-user|in-name|process-path|process-path-regex|process-name-regex|uid|dscp|sub-rule|final|match|and|or|not)\s*?,.+/i.test(
         x
       )
     ) {
@@ -804,11 +846,14 @@ if (binaryInfo != null && binaryInfo.length > 0) {
         .replace(/\s*,\s*pre-matching/, '')
         .replace(/^\s*,\s*/, '')
       rulepolicy = getPolicy(rulePandV)
-      rulevalue = rulePandV
-        .replace(rulepolicy, '')
+      rulevalue = (rulepolicy ? rulePandV.trimEnd().slice(0, -rulepolicy.length) : rulePandV)
         .replace(/\s*,\s*$/, '')
-        .replace(/"/g, '')
+        .replace(/^"([\s\S]*)"$/, '$1')
 
+      if (fromType === 'loon-plugin') {
+        if (/^(final|match)$/i.test(ruletype)) { rulepolicy = rulePandV; rulevalue = '' }
+        else if (!rulepolicy) rulepolicy = 'DIRECT'
+      }
       if (nPolicy != null && !policyRegex.test(rulepolicy)) {
         rulepolicy = nPolicy
         modistatus = 'yes'
@@ -856,6 +901,11 @@ if (binaryInfo != null && binaryInfo.length > 0) {
 
     //脚本解析
     if (/script-path\s*=.+/.test(x)) {
+      if (fromType === 'loon-plugin' && !isLooniOS) {
+        const resolved = resolveLoonLegacySettings(x, sgArg)
+        if (resolved == null) { otherRule.push(`[Unsupported Loon Script settings]\n${_x}`); continue }
+        x = resolved
+      }
       mark = getMark(y, body)
       noteK = isNoteK(x)
       jsurl = getJsInfo(x, /script-path\s*=\s*/)
@@ -895,6 +945,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
       ability = getJsInfo(x, /[=,\s]\s*ability\s*=\s*/)
       engine = getJsInfo(x, /[=,\s]\s*engine\s*=\s*/)
       jsenable = getJsInfo(x, /[=,\s]\s*enabled?\s*=\s*/)
+      if (fromType === 'loon-plugin' && jsenable === 'false') noteK = true
       jsdebug = getJsInfo(x, /[=,\s]\s*debug\s*=\s*/)
       jsenable = jsenable || (!leadingTemplateIsNameOnly && leadingTemplate?.key ? `{${leadingTemplate.key}}` : '')
       getTemplateKeys(jsenable).forEach(key => surgeRuleToggleArgs.set(key, true))
@@ -1067,6 +1118,11 @@ if (binaryInfo != null && binaryInfo.length > 0) {
       mark = getMark(y, body)
       getMockInfo(x, mark, y)
     }
+    if (fromType === 'loon-plugin' && ['[rule]', '[rewrite]', '[script]', '[remote script]'].includes(loonActiveSection) && x && !/^(#|;|\/\/|\[)/.test(x)) {
+      const count = ruleBox.length + rwBox.length + jsBox.length + mockBox.length + rwhdBox.length + rwbodyBox.length + URLRewrite.length + otherRule.length
+      // Legacy body actions may merge into an existing script descriptor.
+      if (count === loonCountBefore && !/\s(?:request|response)-body-(?:json-(?:add|del|replace)|replace-regex)\s/.test(x)) otherRule.push(`[Unconverted Loon ${loonActiveSection}]\n${_x}`)
+    }
   } //for await循环结束
   //console.log($.toStr(jsBox))
   //去重
@@ -1098,11 +1154,8 @@ if (binaryInfo != null && binaryInfo.length > 0) {
     return curr
   }, [])
 
-  rwBox = rwBox.reduce((curr, next) => {
-    /*判断对象中是否已经有该属性  没有的话 push 到 curr数组*/
-    obj[next.rwptn] ? '' : (obj[next.rwptn] = curr.push(next))
-    return curr
-  }, [])
+  // A repeated URL may carry a different action or disabled state.
+  rwBox = uniqueLoonScripts(rwBox)
 
   // BodyRewrite 需不要去重 会顺序执行
   rwbodyBox = [...new Set(rwbodyBox)]
@@ -1113,13 +1166,32 @@ if (binaryInfo != null && binaryInfo.length > 0) {
     return curr
   }, [])
 
-  jsBox = jsBox.reduce((curr, next) => {
-    /*判断对象中是否已经有该属性  没有的话 push 到 curr数组*/
-    obj[next.jstype + next.jsptn + next.jsurl + next.jsarg + next.rebody]
-      ? ''
-      : (obj[next.jstype + next.jsptn + next.jsurl + next.jsarg + next.rebody] = curr.push(next))
-    return curr
-  }, [])
+  if (fromType === 'loon-plugin' && nArgTarget != null) {
+    for (const item of jsBox) {
+      const argument = reJsValue(nArgTarget, nArg, item.jsname || '', item.ori || '', item.jsarg || '')
+      if (argument !== item.jsarg) Object.assign(item, { jsarg: argument, jsargPresent: true, jsargKind: 'string', jsargKeys: [] })
+    }
+  }
+  if (fromType === 'loon-plugin' && reqArr.length === 1) {
+    for (const item of jsBox) item.jsurl = resolveLoonResourceURL(item.jsurl, reqArr[0]) || item.jsurl
+  }
+  if (fromType === 'loon-plugin') jsBox = groupLoonHTTPScripts(jsBox, sgArg, targetApp, reqArr.length === 1 ? reqArr[0] : '')
+  jsBox = uniqueLoonScripts(jsBox)
+  jsBox = jsBox.flatMap(item => {
+    const adapted = adaptLoonObjectScript(item, sgArg, targetApp)
+    if (adapted) return [adapted]
+    otherRule.push(`[Unsupported Loon Argument: missing declaration or non-HTTP script path]\n${item.ori}`)
+    return []
+  })
+
+  const scriptNames = new Set()
+  for (const item of jsBox) {
+    const base = item.jsname || 'script'
+    let name = base, suffix = 2
+    while (scriptNames.has(name)) name = `${base}-${suffix++}`
+    item.jsname = name
+    scriptNames.add(name)
+  }
 
   mockBox = mockBox.reduce((curr, next) => {
     /*判断对象中是否已经有该属性  没有的话 push 到 curr数组*/
@@ -1287,6 +1359,8 @@ if (binaryInfo != null && binaryInfo.length > 0) {
       notBuildInPolicy.push(ori)
     } else if (!policyRegex.test(rulepolicy) && !/^proxy$/i.test(rulepolicy) && modistatus == 'no') {
       notBuildInPolicy.push(ori)
+    } else if (/^(final|match)$/i.test(ruletype)) {
+      rules.push(mark + (isStashiOS ? noteK2 + '- MATCH,' : noteK + 'FINAL,') + rulepolicy)
     } else if (/^in-port|domain-wildcard$/i.test(ruletype) && isSurgeiOS) {
       rules.push(mark + noteK + ruletype + ',' + rulevalue + ',' + rulepolicy + rulenore + rulesni + rulepm)
     } else if (/^protocol$/i.test(ruletype) && (isLooniOS || isSurgeiOS)) {
@@ -1303,9 +1377,9 @@ if (binaryInfo != null && binaryInfo.length > 0) {
       }
       rules.push(mark + noteK + ruletype + ',' + rulevalue + ',' + rulepolicy + rulenore + rulesni + rulepm)
     } else if (/^(?:and|or|not)$/i.test(ruletype) && !isStashiOS) {
-      rules.push(ori)
+      rules.push(mark + noteK + ruletype + ',' + rulevalue + ',' + rulepolicy + rulenore + rulesni + rulepm)
     } else if (/^(?:and|or|not)$/i.test(ruletype) && isStashiOS) {
-      rules.push(mark + noteK2 + '- ' + ori)
+      rules.push(mark + noteK2 + '- ' + ruletype + ',' + rulevalue + ',' + rulepolicy + rulenore)
     } else if (/(?:^domain$|domain-suffix|domain-keyword|ip-|de?st-port)/i.test(ruletype) && isStashiOS) {
       rules.push(mark + noteK2 + '- ' + ruletype + ',' + rulevalue + ',' + rulepolicy + rulenore)
     } else if (/src-port/i.test(ruletype) && (isSurgeiOS || isLooniOS)) {
@@ -1557,6 +1631,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
       jsptn = isLooniOS && jsptn ? ' ' + jsptn : jsptn
       if (/,/.test(jsptn) && isSurgeiOS) jsptn = '"' + jsptn + '"'
       if ((isSurgeiOS || isShadowrocket) && jsptn != '') jsptn = ', pattern=' + jsptn
+      if (fromType === 'loon-plugin') jsptn = protectLoonOutputLiteral(jsptn)
       jsname = jsBox[i].jsname
       img = jsBox[i].img ? ', img-url=' + jsBox[i].img : ''
       eventname = jsBox[i].eventname ? ', event-name=' + jsBox[i].eventname : ', event-name=network-changed'
@@ -1619,6 +1694,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
           jsenable = jsenable && isLooniOS ? ', enable=' + jsenable : ''
           jsdebug = jsdebug && isLooniOS ? ', debug=' + jsdebug : ''
           jsarg = formatScriptArgument(jsarg, scriptArgument, targetApp)
+          if (jsarg != null && fromType === 'loon-plugin' && scriptArgument.kind !== 'object') jsarg = protectLoonOutputLiteral(jsarg)
           if (jsarg == null) {
             otherRule.push(ori)
             continue
@@ -1647,7 +1723,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
                     jsarg
                 )
           } else if (/request|response|generic/.test(jstype) && (isSurgeiOS || isShadowrocket)) {
-            ;/^generic\s/.test(ori)
+            ;/^generic\s/.test(ori) && !jsBox[i].loonV2
               ? otherRule.push(ori)
               : script.push(
                   mark +
@@ -1762,7 +1838,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
     }
 
     for (let i = 0; i < jsBox.length; i++) {
-      if (jsBox[i].noteK != '#') {
+      if (!jsBox[i].noteK) {
         noteKn8 = '\n        '
         noteKn6 = '\n      '
         noteKn4 = '\n    '
@@ -1777,7 +1853,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
       }
       jstype = jsBox[i].jstype.replace(/http-/, '')
       mark = jsBox[i].mark ? jsBox[i].mark : ''
-      jsptn = jsBox[i].jsptn
+      jsptn = fromType === 'loon-plugin' ? protectLoonOutputLiteral(JSON.stringify(jsBox[i].jsptn)) : jsBox[i].jsptn
       jsname = jsBox[i].jsname
       jsurl = jsBox[i].jsurl
       rebody = jsBox[i].rebody ? noteKn6 + 'require-body: ' + istrue(jsBox[i].rebody) : ''
@@ -1785,7 +1861,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
       size = jsBox[i].size ? noteKn6 + 'max-size: ' + jsBox[i].size : ''
       cronexp = jsBox[i].cronexp ? jsBox[i].cronexp.replace(/"/g, '') : null
       timeout = jsBox[i].timeout ? jsBox[i].timeout : ''
-      jsarg = jsBox[i].jsarg != null ? jsBox[i].jsarg.replace(/^"([\s\S]*)"$/, '$1') : ''
+      jsarg = jsBox[i].jsarg ?? ''
       tilesicon = jsBox[i].tilesicon ? jsBox[i].tilesicon : ''
       tilescolor = jsBox[i].tilescolor ? jsBox[i].tilescolor : ''
       ori = jsBox[i].ori
@@ -1814,9 +1890,10 @@ if (binaryInfo != null && binaryInfo.length > 0) {
       }
       jsarg = scriptArgument.present
         ? jstype == 'generic'
-          ? noteKn4 + (jsarg === '' ? 'argument: ""' : 'argument: |-' + noteKn6 + jsarg)
-          : noteKn6 + (jsarg === '' ? 'argument: ""' : 'argument: |-' + noteKn8 + jsarg)
+          ? noteKn4 + 'argument: ' + JSON.stringify(jsarg)
+          : noteKn6 + 'argument: ' + JSON.stringify(jsarg)
         : ''
+      if (fromType === 'loon-plugin') jsarg = protectLoonOutputLiteral(jsarg)
 
       timeout =
         timeout && jstype == 'generic'
@@ -1851,13 +1928,13 @@ if (binaryInfo != null && binaryInfo.length > 0) {
         providers.push(`${noteK2}"` + jsname + '":' + `${noteKn4}url: ` + jsurl + `${noteKn4}interval: 86400`)
       }
       if (jstype == 'generic') {
-        ;/^generic\s/.test(ori)
+        ;/^generic\s/.test(ori) && !jsBox[i].loonV2
           ? otherRule.push(ori)
           : tiles.push(
               mark +
                 `${noteK2}- name: "${jsname}"${noteKn4}interval: 3600${noteKn4}title: "${jsname}"${noteKn4}icon: "${tilesicon}"${noteKn4}backgroundColor: "${tilescolor}"${timeout}${jsarg}`
             )
-        ;/^generic\s/.test(ori)
+        ;/^generic\s/.test(ori) && !jsBox[i].loonV2
           ? ''
           : providers.push(`${noteK2}"${jsname}":${noteKn4}url: ${jsurl}${noteKn4}interval: 86400`)
       }
@@ -2011,6 +2088,9 @@ ${providers}
       break
   } //输出内容结束
   body = body.replace(/\n{2,}/g, '\n\n')
+  if (fromType === 'loon-plugin' && !isLooniOS && (loonV2Stats.detectedV2Count || loonScriptV2Stats.detectedV2Count)) {
+    body += `\n# Script Hub: Loon V2 coverage — Rewrite ${loonV2Stats.convertedV2Count}/${loonV2Stats.detectedV2Count} converted, ${loonV2Stats.unsupportedV2Count} unsupported; Script ${loonScriptV2Stats.convertedV2Count}/${loonScriptV2Stats.detectedV2Count} converted, ${loonScriptV2Stats.unsupportedV2Count} unsupported. Unsupported source entries are retained below as comments.\n`
+  }
   if (isStashiOS && sgArg.length > 0) {
     body = body.replaceAll('{{{', '{').replaceAll('}}}', '}')
     for (let i = 0; i < sgArg.length; i++) {
@@ -2029,9 +2109,19 @@ ${providers}
     body = body.replaceAll('{{{', '{').replaceAll('}}}', '}')
   }
 
+  for (const literal of loonLiteralValues) body = body.replaceAll(literal.marker, () => literal.value)
+
   eval(evJsmodi)
   eval(evUrlmodi)
 
+  for (const entry of notBuildInPolicy) otherRule.push(`[Policy mapping required]\n${entry}`)
+  if (otherRule.length) {
+    body += '\n# Script Hub: unconverted source entries (not executable)\n' +
+      [...new Set(otherRule)].map(entry => String(entry).split(/\r?\n/).map(line => '# ' + line).join('\n')).join('\n') + '\n'
+  }
+  if (fromType === 'loon-plugin' && !isLooniOS && sgArg.length) {
+    body += '\n# Loon Argument: conversion uses declaration defaults; saved Loon user values are unavailable.\n'
+  }
   otherRule = (otherRule[0] || '') && `${app}不支持以下内容:\n${otherRule.join('\n')}`
 
   notBuildInPolicy =
@@ -2520,6 +2610,503 @@ function getLoonArgumentDefault(item) {
   return { key: item.key, hasDefault: true, type: 'string', value }
 }
 
+// Shared lexical boundaries: delimiters inside strings, regexes and variables are data.
+function scanLoonSyntax(text, delimiter) {
+  const parts = []
+  let start = 0, quote = '', regex = false, inClass = false, escaped = false
+  const stack = []
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (escaped) { escaped = false; continue }
+    if (quote) {
+      if (quote === '`' && ch === '`' && text[i + 1] === '`') { i++; continue }
+      if (ch === '\\' && quote !== '`') escaped = true
+      else if (ch === quote) quote = ''
+      continue
+    }
+    if (regex) {
+      if (ch === '\\') escaped = true
+      else if (ch === '[') inClass = true
+      else if (ch === ']') inClass = false
+      else if (ch === '/' && !inClass) regex = false
+      continue
+    }
+    if (ch === '$' && text[i + 1] === '{') {
+      const end = text.indexOf('}', i + 2)
+      if (end < 0) return null
+      i = end; continue
+    }
+    if (ch === '"' || ch === "'" || ch === '`') { quote = ch; continue }
+    if (delimiter === 'comment' && (i === 0 || /\s/.test(text[i - 1])) && (ch === '#' || ch === ';' || text.slice(i, i + 2) === '//')) return text.slice(0, i).trimEnd()
+    if (ch === '/' && /(?:^|[=~,(\[]\s*)$/.test(text.slice(0, i))) { regex = true; continue }
+    if ('([{'.includes(ch)) stack.push(ch)
+    else if (')]}'.includes(ch)) {
+      if ('([{'.indexOf(stack.pop()) !== ')]}'.indexOf(ch)) return null
+    } else if (!stack.length && delimiter !== 'comment' && text.slice(i, i + delimiter.length) === delimiter) {
+      parts.push(text.slice(start, i).trim()); i += delimiter.length - 1; start = i + 1
+    }
+  }
+  if (quote || regex || stack.length) return null
+  return delimiter === 'comment' ? text.trimEnd() : [...parts, text.slice(start).trim()]
+}
+
+function splitLoonConfigLines(text) {
+  const physical = text.split(/\r?\n/), lines = []
+  for (let i = 0; i < physical.length; i++) {
+    let line = physical[i]
+    if (!line.trim()) continue
+    if (/^\s*(?:(?:request|response)\s+if\b|(?:cron\s+.+|generic|network-changed)\s+then\s+script\s*\()/i.test(line)) {
+      while (scanLoonSyntax(stripLoonComment(line), ',') == null && i + 1 < physical.length) {
+        // A malformed statement must not swallow the next section or executable statement.
+        if (/^\s*(?:\[[^\]]+\]\s*$|(?:request|response)\s+if\b|(?:cron\s+.+|generic|network-changed)\s+then\b)/i.test(physical[i + 1])) break
+        line += '\n' + physical[++i]
+      }
+    }
+    lines.push(line)
+  }
+  return lines
+}
+
+function protectLoonOutputLiteral(value) {
+  if (!value) return value
+  const marker = `${loonLiteralPrefix}${loonLiteralValues.length}__`
+  loonLiteralValues.push({ marker, value })
+  return marker
+}
+
+function stripLoonComment(text) {
+  if (/^\s*(?:#|;|\/\/)/.test(text)) return text
+  return scanLoonSyntax(text, 'comment') ?? text
+}
+
+function uniqueLoonScripts(items) {
+  const seen = new Set()
+  return items.filter(item => {
+    // Only source location and display comments are irrelevant to execution.
+    const keys = Object.keys(item).filter(key => !['mark', 'ori', 'num'].includes(key)).sort()
+    const key = JSON.stringify(keys.map(key => [key, item[key]]))
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+function resolveLoonResourceURL(path, source) {
+  if (/^https?:\/\//i.test(path)) return path
+  const base = String(source || '').match(/^(https?:\/\/[^/]+)(\/[^?#]*)?/i)
+  if (!base || /https?:\/\/local\.text$/i.test(base[1])) return null
+  if (path.startsWith('//')) return base[1].split(':')[0] + ':' + path
+  const joined = path.startsWith('/') ? path : (base[2] || '/').replace(/[^/]*$/, '') + path
+  const parts = []
+  for (const part of joined.split('/')) {
+    if (part === '..') parts.pop()
+    else if (part !== '.') parts.push(part)
+  }
+  return base[1] + (parts.join('/').startsWith('/') ? '' : '/') + parts.join('/')
+}
+
+function bindLoonResourceReferences(line, source) {
+  if (!resolveLoonResourceURL('resource', source)) return line
+  const statement = scanLoonSyntax(line, ' then ')
+  if (statement?.length !== 2) return line
+  const withOptions = splitLoonScriptWith(statement[1])
+  if (!withOptions) return line
+  const actions = scanLoonSyntax(withOptions.action, '|')
+  if (!actions) return line
+  const rewritten = actions.map(action => {
+    const match = action.match(/^([a-z_.]+)\s*\(([\s\S]*)\)$/)
+    if (!match) return action
+    const index = match[1] === 'script' || /\.json\.jq_file$/.test(match[1]) ? 0 : /\.body\.mock_file$/.test(match[1]) ? 1 : -1
+    if (index < 0) return action
+    const args = splitLoonV2Args(match[2])
+    if (!args || args[index] == null) return action
+    const path = parseLoonV2String(args[index])
+    if (path == null || /\$\{/.test(path)) return action
+    const resolved = resolveLoonResourceURL(path, source)
+    if (!resolved) return action
+    args[index] = JSON.stringify(resolved)
+    return match[1] + '(' + args.join(', ') + ')'
+  })
+  return statement[0] + ' then ' + rewritten.join(' | ') + (withOptions.options ? ' with ' + withOptions.options : '')
+}
+
+function groupLoonHTTPScripts(items, declarations, target, source) {
+  if (target === 'loon-plugin') return items
+  const replacements = new Map(), removed = new Set()
+  for (const phase of ['request', 'response']) {
+    const rewrites = items.filter(item => item.jstype === `http-${phase}` && !item.noteK && item.loonRewrite)
+    const candidates = items.filter(item => item.jstype === `http-${phase}` && !item.noteK && !item.loonRewrite && !/\/scripts\/loon-rewrite-v2\.js(?:$|\?)/.test(item.jsurl))
+    if (!candidates.some(item => item.runtimeCondition) && rewrites.length < 2 && !(rewrites.length && candidates.length)) continue
+    const rules = candidates.map(item => {
+      let condition = item.runtimeCondition
+      if (!condition) {
+        const prefix = item.jsptn.match(/^\(\?([ims]+)\)/)
+        const pattern = prefix ? item.jsptn.slice(prefix[0].length) : item.jsptn
+        const flags = prefix ? prefix[1] : item.loonV2 ? '' : 'i'
+        try { new RegExp(pattern, flags) } catch { throw new Error(`Loon script regex is not supported by the target JavaScript engine: ${item.ori}`) }
+        condition = { kind: 'regex', left: { variable: 'url' }, pattern, flags }
+      }
+      const path = resolveLoonResourceURL(item.jsurl, source)
+      if (!path) throw new Error(`Cannot resolve Loon script resource: ${item.jsurl}`)
+      const meta = getScriptArgumentMeta(item)
+      let argument = meta.present ? item.jsarg : null
+      if (meta.kind === 'object') {
+        const defaults = getLoonArgumentDefaultMap(declarations)
+        argument = Object.fromEntries(meta.keys.map(key => {
+          const entry = defaults.get(key)
+          if (!entry) throw new Error(`Unknown Loon argument: ${key}`)
+          return [key, entry.hasDefault ? entry.value : null]
+        }))
+      }
+      return { path, condition, argument, requiresBody: item.rebody === 'true', binary: item.proto === 'true', timeout: Number(item.timeout) || 20, name: item.jsname }
+    })
+    const rewriteSpecs = rewrites.map(item => {
+      const spec = JSON.parse(decodeURIComponent(item.jsarg))
+      if (!spec.condition) {
+        const prefix = item.jsptn.match(/^\(\?([ims]+)\)/)
+        spec.condition = { kind: 'regex', left: { variable: 'url' }, pattern: prefix ? item.jsptn.slice(prefix[0].length) : item.jsptn, flags: prefix ? prefix[1] : '' }
+      }
+      return spec
+    })
+    const bundle = { version: 1, phase, rules, rewrites: rewriteSpecs }
+    const runtimeURL = 'https://raw.githubusercontent.com/Primovist/script-hub/main/scripts/loon-rewrite-v2.js'
+    const jsurl = 'http://script.hub/convert/_start_/' + runtimeURL + '/_end_/loon-dispatch.js?type=loon-bundle-script&target=' + target.split('-')[0] + '-script&loonBundle=' + encodeURIComponent(JSON.stringify(bundle))
+    const grouped = [...candidates, ...rewrites].sort((a, b) => a.num - b.num)
+    const first = grouped[0]
+    replacements.set(first, { ...first, jsname: `loon-${phase}-dispatch`, jsptn: '^https?://', jsurl,
+      rebody: grouped.some(item => item.rebody === 'true') ? 'true' : '', proto: grouped.some(item => item.proto === 'true') ? 'true' : '',
+      timeout: String(Math.max(20, ...grouped.map(item => Number(item.timeout) || 20))),
+      jsarg: '', jsargPresent: false, jsargKind: 'none', jsargKeys: [], runtimeCondition: undefined,
+    })
+    grouped.slice(1).forEach(item => removed.add(item))
+  }
+  return items.filter(item => !removed.has(item)).map(item => replacements.get(item) || item)
+}
+
+function resolveLoonLegacySettings(line, declarations) {
+  const defaults = getLoonArgumentDefaultMap(declarations)
+  let invalid = false
+  const parts = splitLoonV2Args(line)
+  if (!parts) return null
+  let result = parts.map(part => part.replace(/^(enable[d]?|debug|timeout)\s*=\s*\{([A-Za-z_][A-Za-z0-9_]*)\}$/, (_, option, key) => {
+    const item = defaults.get(key)
+    const timeout = option === 'timeout'
+    if (!item || (timeout ? !['string', 'number'].includes(item.type) : item.type !== 'boolean')) { invalid = true; return '' }
+    const value = item.hasDefault ? item.value : timeout ? (/^http-/.test(line) ? 20 : 300) : option !== 'debug'
+    if (timeout && (!Number.isFinite(Number(value)) || Number(value) <= 0)) invalid = true
+    return `${option}=${value}`
+  })).join(', ')
+  result = result.replace(/^cron\s+\{([A-Za-z_][A-Za-z0-9_]*)\}/, (_, key) => {
+    const item = defaults.get(key)
+    if (!item?.hasDefault || item.type !== 'string') { invalid = true; return '' }
+    return 'cron ' + JSON.stringify(item.value)
+  })
+  return invalid ? null : result
+}
+
+function loonRejectScript(parsed, source, index) {
+  if (!parsed.ok || parsed.phase !== 'request' || !['reject', 'reject-dict', 'reject-array'].includes(parsed.action.type)) return null
+  const type = parsed.action.type === 'reject' ? 'text' : 'json'
+  const body = parsed.action.type === 'reject-dict' ? '{}' : parsed.action.type === 'reject-array' ? '[]' : parsed.action.body ?? ''
+  return loonExtendedRewriteScript({ phase: 'response', condition: parsed.condition, actions: [{ name: 'body.mock', args: [type, body, parsed.action.status] }] }, source, index)
+}
+
+function adaptLoonObjectScript(item, declarations, target) {
+  if (target === 'loon-plugin' || item.jsargKind !== 'object') return item
+  const defaults = getLoonArgumentDefaultMap(declarations)
+  const values = Object.create(null)
+  for (const key of item.jsargKeys) {
+    const entry = defaults.get(key)
+    if (!entry) return null
+    values[key] = entry.hasDefault ? entry.value : null
+  }
+  // An Object must remain an Object; passing a JSON string alone changes script semantics.
+  const prelude = 'var $argument = JSON.parse(decodeURIComponent(' + JSON.stringify(encodeURIComponent(JSON.stringify(values))) + '));'
+  const path = item.jsurl
+  if (!/^https?:\/\//i.test(path)) return null
+  const wrapped = 'http://script.hub/convert/_start_/' + path + '/_end_/loon-argument.js?type=loon-script&target=' + target.split('-')[0] + '-script&prepend=' + encodeURIComponent(prelude)
+  return { ...item, jsurl: wrapped, jsarg: '', jsargPresent: false, jsargKind: 'none', jsargKeys: [] }
+}
+
+function parseLoonTypedValue(token, declarations, phase, captures = {}) {
+  token = token.trim()
+  const defaults = getLoonArgumentDefaultMap(declarations)
+  function variable(name) {
+    const declared = defaults.get(name)
+    if (declared) return declared.hasDefault ? { value: declared.value, type: declared.type } : null
+    if (name === 'url' || name === 'request.method') return { variable: name, type: 'string' }
+    if (name === 'response.status') return phase === 'response' ? { variable: name, type: 'number' } : null
+    if (/^(request|response)\.header\['[^']+'\]$/.test(name)) return phase === 'response' || name.startsWith('request.') ? { variable: name, type: 'string' } : null
+    const capture = name.match(/^([A-Za-z_][A-Za-z0-9_]*)\.(\d+)$/)
+    return capture && Object.prototype.hasOwnProperty.call(captures, capture[1]) && Number(capture[2]) <= captures[capture[1]]
+      ? { variable: name, type: 'string' } : null
+  }
+  const reference = token.match(/^\$\{([^}]+)\}$/)
+  if (reference) return variable(reference[1])
+  if (token.startsWith('"')) {
+    if (parseLoonV2String(token) == null) return null
+    const parts = []
+    let start = 1, escaped = false
+    for (let i = 1; i < token.length - 1; i++) {
+      if (escaped) { escaped = false; continue }
+      if (token[i] === '\\') { escaped = true; continue }
+      if (token.slice(i, i + 2) === '${') {
+        const end = token.indexOf('}', i + 2)
+        if (end < 0) return null
+        const item = variable(token.slice(i + 2, end))
+        if (!item) return null
+        const literal = parseLoonV2String('"' + token.slice(start, i) + '"')
+        if (literal == null) return null
+        parts.push({ value: literal }, item)
+        start = end + 1; i = end
+      }
+    }
+    const literal = parseLoonV2String('"' + token.slice(start, -1) + '"')
+    if (literal == null) return null
+    parts.push({ value: literal })
+    return parts.every(item => Object.prototype.hasOwnProperty.call(item, 'value'))
+      ? { value: parts.map(item => String(item.value)).join(''), type: 'string' }
+      : { template: parts, type: 'string' }
+  }
+  const parsed = parseLoonStaticLiteral(token)
+  return parsed.ok ? { value: parsed.value, type: parsed.value === null ? 'null' : typeof parsed.value } : null
+}
+
+function loonGuaranteedCaptures(node) {
+  if (node.kind === 'regex') return node.capture ? { [node.capture]: countLoonRegexCaptures(node.pattern) } : {}
+  if (!node.children) return {}
+  const children = node.children.map(loonGuaranteedCaptures)
+  if (node.kind === 'and') return Object.assign({}, ...children)
+  return Object.fromEntries(Object.entries(children[0]).filter(([key]) => children.every(child => Object.prototype.hasOwnProperty.call(child, key))))
+}
+
+function parseLoonRuntimeCondition(text, declarations, phase, allowCaptures = false) {
+  const names = new Set()
+  function parse(expression) {
+    expression = stripLoonOuterParens(expression)
+    for (const [operator, kind] of [['||', 'or'], ['&&', 'and']]) {
+      const parts = splitLoonTopLevelOperator(expression, operator)
+      if (parts.length > 1) {
+        const children = parts.map(parse)
+        return children.every(Boolean) ? { kind, children } : null
+      }
+    }
+    for (const operator of ['==', '~=']) {
+      const parts = scanLoonSyntax(expression, operator)
+      if (parts?.length !== 2) continue
+      const left = parseLoonTypedValue(parts[0], declarations, phase)
+      if (!left) return null
+      if (operator === '~=') {
+        let token = parts[1]
+        if (token.startsWith('${')) {
+          const value = parseLoonTypedValue(token, declarations, phase)
+          if (value?.type !== 'string' || typeof value.value !== 'string') return null
+          token = value.value
+        }
+        const regex = parseLoonRegexLiteralPrefix(token)
+        if (!regex || left.type !== 'string') return null
+        const capture = regex.rest.match(/^as\s+([A-Za-z_][A-Za-z0-9_]*)$/)?.[1]
+        if (regex.rest && (!allowCaptures || !capture || names.has(capture) || getLoonArgumentDefaultMap(declarations).has(capture))) return null
+        if (capture) names.add(capture)
+        try { new RegExp(regex.pattern, regex.flags) } catch { return null }
+        return { kind: 'regex', left, pattern: regex.pattern, flags: regex.flags, ...(capture ? { capture } : {}) }
+      }
+      const right = parseLoonTypedValue(parts[1], declarations, phase)
+      if (!right || (left.type !== right.type && !(left.variable?.includes('.header[') && right.type === 'null'))) return null
+      return { kind: 'equal', left, right }
+    }
+    const value = parseLoonTypedValue(expression, declarations, phase)
+    return value?.type === 'boolean' && typeof value.value === 'boolean' ? { kind: 'constant', value: value.value } : null
+  }
+  return parse(text)
+}
+
+function loonHasURLGuard(condition) {
+  if (['regex', 'equal'].includes(condition.kind)) return condition.left.variable === 'url'
+  if (condition.kind === 'and') return condition.children.some(loonHasURLGuard)
+  if (condition.kind === 'or') return condition.children.every(loonHasURLGuard)
+  return false
+}
+
+function loonRuntimeURLGuard(condition) {
+  if (condition.kind === 'regex' && condition.left.variable === 'url') return loonV2RegexForLegacy(condition.pattern, condition.flags)
+  if (condition.kind === 'equal' && condition.left.variable === 'url' && typeof condition.right.value === 'string') return '^' + condition.right.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$'
+  if (condition.kind === 'and') return condition.children.map(loonRuntimeURLGuard).find(Boolean) || null
+  return null
+}
+
+function loonMandatoryURLRegexes(node) {
+  if (node.kind === 'regex' && node.left.variable === 'url') return [node]
+  if (node.kind === 'and') return node.children.flatMap(loonMandatoryURLRegexes)
+  return []
+}
+
+function parseLoonExtendedRewrite(line, declarations) {
+  const prefix = line.match(/^(request|response)\s+if\s+/i)
+  if (!prefix) return null
+  const parts = scanLoonSyntax(line.slice(prefix[0].length), ' then ')
+  if (!parts || parts.length !== 2) return null
+  const phase = prefix[1].toLowerCase()
+  const runtime = parseLoonRuntimeCondition(parts[0], declarations, phase, true)
+  if (!runtime) return null
+  const captures = loonGuaranteedCaptures(runtime)
+  const simple = parseLoonV2ConditionWithDefaults(parts[0], declarations)
+  const condition = simple || { pattern: loonRuntimeURLGuard(runtime) || '^https?://', flags: '' }
+  const rawActions = scanLoonSyntax(parts[1], '|')
+  if (!rawActions) return null
+  const schemas = {
+    'url.replace': ['string'], redirect: ['number', 'string'], reject: ['number'], reject_dict: ['number'], reject_array: ['number'], reject_img: ['number'], reject_video: ['number'],
+    'header.add': ['string', 'string'], 'header.set': ['string', 'string'], 'header.del': ['string'], 'header.replace': ['string', 'regex', 'string'],
+    'body.replace': ['regex', 'string'], 'body.mock': ['string', 'string'], 'body.mock_file': ['string', 'string'],
+    'json.add': ['string', 'any'], 'json.delete': ['string'], 'json.replace': ['string', 'any'], 'json.jq': ['string'], 'json.jq_file': ['string'],
+  }
+  const actions = []
+  for (const raw of rawActions) {
+    const match = raw.match(/^([a-z_.]+)\s*\(([\s\S]*)\)$/)
+    if (!match) return null
+    const terminal = /^(?:url\.replace|redirect|reject(?:_dict|_array|_img|_video)?)$/.test(match[1])
+    if (terminal ? phase !== 'request' : !match[1].startsWith(phase + '.')) return null
+    const name = terminal ? match[1] : match[1].slice(phase.length + 1)
+    const schema = schemas[name]
+    if (!schema) return null
+    const args = splitLoonV2Args(match[2])
+    const mock = name === 'body.mock' || name === 'body.mock_file'
+    if (!args || (!mock && args.length !== schema.length && !(name === 'reject' && args.length === 2)) || (mock && (args.length < 2 || args.length > (phase === 'response' ? 4 : 3)))) return null
+    const batch = args.map(arg => arg.startsWith('[') && arg.endsWith(']') ? splitLoonV2Args(arg.slice(1, -1)) : null)
+    if (batch.some(Boolean) && (batch.some(value => !value?.length || value.some(x => !x)) || batch.some(value => value.length !== batch[0].length) || mock || terminal || name.startsWith('json.jq'))) return null
+    const rows = batch[0] ? batch[0].map((_, i) => batch.map(col => col[i])) : [args]
+    for (const row of rows) {
+      const values = []
+      for (let i = 0; i < row.length; i++) {
+        const token = row[i]
+        const expected = schema[i] || (name === 'reject' ? 'string' : phase === 'response' && i === 2 ? 'number' : 'boolean')
+        if (expected === 'regex') {
+          let regex = parseLoonRegexLiteral(token)
+          if (!regex) {
+            const bound = parseLoonTypedValue(token, declarations, phase, captures)
+            if (bound?.type === 'string' && typeof bound.value === 'string') regex = parseLoonRegexLiteral(bound.value)
+          }
+          if (!regex) return null
+          try { new RegExp(regex.pattern, regex.flags) } catch { return null }
+          values.push({ pattern: regex.pattern, flags: regex.flags })
+        } else {
+          const value = parseLoonTypedValue(token, declarations, phase, captures)
+          if (!value || (expected !== 'any' && value.type !== expected)) return null
+          values.push(Object.prototype.hasOwnProperty.call(value, 'value') ? value.value : { loonValue: value })
+        }
+      }
+      if (name.startsWith('json.') && !name.startsWith('json.jq') && typeof values[0] === 'string' && !/^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+|\[\d+\])*$/.test(values[0])) return null
+      if (mock) {
+        if (typeof values[0] === 'string' && !['json', 'text', 'plain', 'css', 'html', 'javascript', 'svg', 'png', 'gif', 'jpeg', 'tiff', 'mp4', 'form-data'].includes(values[0])) return null
+        if (phase === 'response' && typeof values[2] === 'number' && (!Number.isInteger(values[2]) || values[2] < 100 || values[2] > 599)) return null
+      }
+      let urlPattern
+      if (terminal) {
+        if (name === 'url.replace' || name === 'redirect') {
+          const guards = loonMandatoryURLRegexes(runtime)
+          if (guards.length !== 1) return null
+          urlPattern = { pattern: guards[0].pattern, flags: guards[0].flags }
+        }
+        if (name !== 'url.replace' && typeof values[0] === 'number' && (!Number.isInteger(values[0]) || values[0] < 100 || values[0] > 599)) return null
+        if (name === 'redirect' && typeof values[0] === 'number' && ![302, 307].includes(values[0])) return null
+        const replacement = name === 'url.replace' ? values[0] : name === 'redirect' ? values[1] : null
+        if (typeof replacement === 'string' && /\$\d+/.test(replacement)) return null
+      }
+      actions.push({ name, args: values, ...(urlPattern ? { urlPattern } : {}) })
+    }
+  }
+  const mocks = actions.filter(action => /^body\.mock(?:_file)?$/.test(action.name))
+  if (phase === 'response' && mocks.length && (mocks.length !== 1 || actions.some(action => !/^body\.mock(?:_file)?$/.test(action.name) && !action.name.startsWith('header.')))) return null
+  if (phase === 'response' && mocks.length && /\$\{response\./.test(parts.join(' '))) return null
+  return { phase, condition, runtimeCondition: !simple || simple.captureName ? runtime : null, actions }
+}
+
+function compactLoonJQ(source) {
+  const stack = [{ kind: 'code', depth: 0 }]
+  let result = ''
+  for (let i = 0; i < source.length; i++) {
+    const char = source[i], state = stack[stack.length - 1]
+    if (state.kind === 'string') {
+      result += char
+      if (char === '\\') {
+        const next = source[++i]
+        if (next === undefined) return null
+        result += next
+        if (next === '(') stack.push({ kind: 'code', depth: 1 })
+      } else if (char === '"') stack.pop()
+    } else if (char === '"') {
+      result += char; stack.push({ kind: 'string' })
+    } else if (char === '#') {
+      while (i + 1 < source.length && source[i + 1] !== '\n') i++
+      result += ' '
+    } else {
+      if (stack.length > 1 && char === '(') state.depth++
+      if (stack.length > 1 && char === ')' && --state.depth === 0) stack.pop()
+      result += /\s/.test(char) ? ' ' : char
+    }
+  }
+  return stack.length === 1 ? result.trim() : null
+}
+
+function loonNativeJQProgram(parsed) {
+  if (parsed.runtimeCondition) return null
+  const filters = []
+  for (const action of parsed.actions) {
+    if (!/^json\.(add|delete|replace|jq)$/.test(action.name) || action.args.some(value => value && typeof value === 'object')) return null
+    const [path, value] = action.args
+    if (action.name === 'json.jq') {
+      if (typeof path !== 'string') return null
+      const filter = compactLoonJQ(path)
+      if (filter == null) return null
+      filters.push('(' + filter + ')')
+      continue
+    }
+    const keys = []
+    const pattern = /([^.\[\]]+)|\[(\d+)\]/g
+    let match
+    while ((match = pattern.exec(path))) keys.push(match[2] === undefined ? match[1] : Number(match[2]))
+    const encoded = JSON.stringify(keys)
+    if (action.name === 'json.delete') filters.push('delpaths([' + encoded + '])')
+    else if (action.name === 'json.add') filters.push('setpath(' + encoded + ';' + JSON.stringify(value) + ')')
+    else filters.push('(if (getpath(' + JSON.stringify(keys.slice(0, -1)) + ') | has(' + JSON.stringify(keys[keys.length - 1]) + ')) then setpath(' + encoded + ';' + JSON.stringify(value) + ') else . end)')
+  }
+  if (!filters.length) return null
+  let variable = '__script_hub_before_action'
+  while (filters.some(filter => filter.includes(variable))) variable += '_'
+  return filters.map(filter => `(. as $${variable} | try (${filter}) catch $${variable})`).join(' | ')
+}
+
+async function resolveLoonJQFiles(parsed, source, fetchResource) {
+  for (const action of parsed.actions) {
+    if (action.name !== 'json.jq_file') continue
+    const path = action.args[0]
+    if (typeof path !== 'string') throw new Error('jq_file path requires a static resource URL')
+    const url = resolveLoonResourceURL(path, source)
+    if (!url) throw new Error('Cannot resolve jq_file resource: ' + path)
+    const response = await fetchResource(url)
+    if (Number(response.status ?? response.statusCode) !== 200 || typeof response.body !== 'string') throw new Error('Cannot read jq_file resource: ' + url)
+    // Preserve jq comments/newlines as source; config escaping keeps it on one physical line.
+    action.name = 'json.jq'
+    action.args = [response.body]
+  }
+  return parsed
+}
+
+function loonExtendedRewriteScript(parsed, source, index) {
+  if (parsed.actions.some(action => /^json\.jq(?:_file)?$/.test(action.name))) return null
+  const mock = parsed.phase === 'response' && parsed.actions.some(action => /^body\.mock(?:_file)?$/.test(action.name))
+  return {
+    loonRewrite: true,
+    jstype: mock ? 'http-request' : `http-${parsed.phase}`,
+    jsptn: loonV2RegexForLegacy(parsed.condition.pattern, parsed.condition.flags),
+    jsname: `loon-rewrite-${index}`, jsurl: 'https://raw.githubusercontent.com/Primovist/script-hub/main/scripts/loon-rewrite-v2.js',
+    jsarg: encodeURIComponent(JSON.stringify({ phase: parsed.phase, mock, condition: parsed.runtimeCondition, actions: parsed.actions, resourceBase: parsed.resourceBase })),
+    jsargPresent: true, jsargKind: 'string',
+    rebody: !mock && parsed.actions.some(action => /^(body|json)\./.test(action.name)) ? 'true' : '',
+    timeout: '20', noteK: !!parsed.condition.disabledByDefault, ori: source, num: index,
+  }
+}
+
 function getLoonArgumentDefaultMap(declaredArguments) {
   const result = new Map()
   if (!Array.isArray(declaredArguments)) return result
@@ -2577,7 +3164,7 @@ function resolveLoonArgumentDefaults(text, declaredArguments) {
 function parseLoonStaticLiteral(text) {
   const value = text.trim()
   if (/^(?:true|false|null)$/.test(value)) return { ok: true, value: value === 'true' ? true : value === 'false' ? false : null }
-  if (/^-?(?:\d+\.?\d*|\.\d+)$/.test(value)) return { ok: true, value: Number(value) }
+  if (/^-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(value)) return { ok: Number.isFinite(Number(value)), value: Number(value) }
   const string = parseLoonV2String(value)
   return string == null ? { ok: false } : { ok: true, value: string }
 }
@@ -2591,44 +3178,12 @@ function evaluateLoonStaticComparison(text) {
 }
 
 function splitLoonTopLevelOperator(text, operator) {
-  const parts = []
-  let start = 0, quote = '', escaped = false, regex = false, inClass = false, depth = 0
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i]
-    if (escaped) { escaped = false; continue }
-    if (quote) {
-      if (ch === '\\' && quote !== '`') escaped = true
-      else if (ch === quote) quote = ''
-      continue
-    }
-    if (regex) {
-      if (ch === '\\') escaped = true
-      else if (ch === '[') inClass = true
-      else if (ch === ']' && inClass) inClass = false
-      else if (ch === '/' && !inClass) regex = false
-      continue
-    }
-    if (ch === '"' || ch === '`') { quote = ch; continue }
-    if (ch === '/' && /(?:^|[=~,(\[]\s*)$/.test(text.slice(0, i))) { regex = true; continue }
-    if (ch === '(') depth++
-    else if (ch === ')') depth--
-    else if (depth === 0 && text.slice(i, i + operator.length) === operator) {
-      parts.push(text.slice(start, i).trim()); start = i + operator.length; i += operator.length - 1
-    }
-  }
-  parts.push(text.slice(start).trim())
-  return parts
+  return scanLoonSyntax(text, operator) || [text]
 }
 
 function stripLoonOuterParens(text) {
   let value = text.trim()
-  while (value[0] === '(' && value[value.length - 1] === ')') {
-    let depth = 0, wraps = true
-    for (let i = 0; i < value.length; i++) {
-      if (value[i] === '(') depth++
-      else if (value[i] === ')' && --depth === 0 && i !== value.length - 1) { wraps = false; break }
-    }
-    if (!wraps || depth !== 0) break
+  while (value.startsWith('(') && value.endsWith(')') && scanLoonSyntax(value.slice(1, -1), ',') !== null) {
     value = value.slice(1, -1).trim()
   }
   return value
@@ -2653,9 +3208,10 @@ function evaluateLoonStaticExpression(text) {
 function parseLoonV2ConditionWithDefaults(text, declaredArguments) {
   const resolved = resolveLoonArgumentDefaults(text, declaredArguments)
   if (!resolved.ok) return null
-  const direct = parseLoonRewriteV2Condition(resolved.value)
+  const expression = stripLoonOuterParens(resolved.value)
+  const direct = parseLoonRewriteV2Condition(expression)
   if (direct) return direct
-  const terms = splitLoonTopLevelOperator(resolved.value, '&&')
+  const terms = splitLoonTopLevelOperator(expression, '&&')
   if (terms.length < 2) return null
   let urlCondition = null, disabledByDefault = false
   for (const term of terms) {
@@ -2679,7 +3235,7 @@ function isLoonScriptV2Statement(line) {
 }
 
 function parseLoonScriptV2(line, declaredArguments) {
-  let jstype, jsptn = '', cronexp = '', rest, condition = null
+  let jstype, jsptn = '', cronexp = '', rest, condition = null, runtimeCondition = null
   const http = line.match(/^\s*(request|response)\s+if\s+/i)
   if (http) {
     jstype = `http-${http[1].toLowerCase()}`
@@ -2688,13 +3244,15 @@ function parseLoonScriptV2(line, declaredArguments) {
     let actionText = ''
     for (const separator of separators) {
       condition = parseLoonV2ConditionWithDefaults(rest.slice(0, separator.index).trim(), declaredArguments)
-      if (condition && !condition.captureName) {
+      if (!condition) runtimeCondition = parseLoonRuntimeCondition(rest.slice(0, separator.index).trim(), declaredArguments, http[1].toLowerCase())
+      if ((condition && !condition.captureName) || runtimeCondition) {
         actionText = rest.slice(separator.index + separator[0].length).trim()
         break
       }
     }
-    if (!condition || !actionText) return null
-    jsptn = loonV2RegexForLegacy(condition.pattern, condition.flags)
+    if ((!condition && !runtimeCondition) || !actionText) return null
+    if (runtimeCondition && jstype === 'http-response' && !loonHasURLGuard(runtimeCondition)) return null
+    jsptn = condition ? loonV2RegexForLegacy(condition.pattern, condition.flags) : loonRuntimeURLGuard(runtimeCondition) || '^https?://'
     rest = actionText
   } else {
     const cron = line.match(/^\s*cron\s+([\s\S]+?)\s+then\s+/i)
@@ -2718,8 +3276,10 @@ function parseLoonScriptV2(line, declaredArguments) {
   if (!call || !options) return null
   const jsname = options.tag || call.path.substring(call.path.lastIndexOf('/') + 1).replace(/\.js(?:\?.*)?$/, '')
   return {
+    loonV2: true,
     jstype,
     jsptn,
+    ...(runtimeCondition ? { runtimeCondition } : {}),
     cronexp,
     jsurl: call.path,
     jsarg: call.argument.value == null ? '' : call.argument.value,
@@ -2766,26 +3326,32 @@ function parseLoonScriptCall(text, declaredArguments) {
   return { path, argument }
 }
 
+function hasUnresolvedLoonTemplate(text, declarations) {
+  if (text.startsWith('`')) return false
+  const defaults = getLoonArgumentDefaultMap(declarations)
+  for (const match of text.matchAll(/\$\{([^}]+)\}/g)) {
+    let escapes = 0
+    for (let i = match.index - 1; i >= 0 && text[i] === '\\'; i--) escapes++
+    if (escapes % 2 === 0 && !defaults.has(match[1])) return true
+  }
+  return false
+}
+
 function parseLoonScriptArgument(text, declaredArguments) {
   if (typeof text === 'undefined') return { present: false, kind: 'none', value: null, keys: [] }
   const source = text.trim()
-  const stringValue = parseLoonV2String(source)
-  if (stringValue != null) {
-    const resolved = resolveLoonArgumentDefaults(source, declaredArguments)
-    if (!resolved.ok) return null
-    const value = parseLoonV2String(resolved.value)
-    if (value == null || /\$\{[^}]+\}/.test(value)) return null
-    return { present: true, kind: 'string', value, keys: [] }
-  }
-  if (/^`[^`]*`$/.test(source)) {
-    return { present: true, kind: 'string', value: source.slice(1, -1), keys: [], raw: true }
+  if (source.startsWith('"') || source.startsWith('`') || /^\$\{/.test(source)) {
+    const parsed = parseLoonTypedValue(source, declaredArguments, 'request')
+    if (!parsed || parsed.type !== 'string' || typeof parsed.value !== 'string') return null
+    return { present: true, kind: 'string', value: parsed.value, keys: [], ...(source.startsWith('`') ? { raw: true } : {}) }
   }
   const object = parseLoonPluginObjectArgument(source, declaredArguments, true)
   return object && { present: true, kind: 'object', value: `{${object.keys.join(',')}}`, keys: object.keys }
 }
 
 function parseLoonPluginObjectArgument(text, declaredArguments, v2 = false) {
-  const source = `${text ?? ''}`.trim()
+  let source = `${text ?? ''}`.trim()
+  if (!v2 && /^\[(?:\s*\{[A-Za-z_][A-Za-z0-9_]*\}\s*,?)+\]$/.test(source)) source = '{' + source.slice(1, -1).replace(/[{}]/g, '') + '}'
   if (!/^\{[\s\S]*\}$/.test(source)) return null
   const body = source.slice(1, -1).trim()
   if (!body) return null
@@ -2806,7 +3372,7 @@ function parseLoonLegacyScriptArgument(line, declaredArguments) {
   if (!matched) return { present: false, kind: 'none', value: null, keys: [] }
   const start = matched.index + matched[0].length
   const tail = line.slice(start)
-  let quote = '', escaped = false, braceDepth = 0, end = tail.length
+  let quote = '', escaped = false, braceDepth = 0, bracketDepth = 0, end = tail.length
   for (let i = 0; i < tail.length; i++) {
     const ch = tail[i]
     if (escaped) { escaped = false; continue }
@@ -2815,9 +3381,11 @@ function parseLoonLegacyScriptArgument(line, declaredArguments) {
     if (ch === '"' || ch === "'") { quote = ch; continue }
     if (ch === '{') braceDepth++
     else if (ch === '}') braceDepth--
-    else if (ch === ',' && braceDepth === 0 && /^\s*(?:script-path|pattern|timeout|argument|script-update-interval|requires-body|max-size|ability|binary-body-mode|cronexpr?|wake-system|enabled?|engine|tag|type|img-url|debug|event-name|desc)\s*=/i.test(tail.slice(i + 1))) { end = i; break }
+    else if (ch === '[') bracketDepth++
+    else if (ch === ']') bracketDepth--
+    else if (ch === ',' && braceDepth === 0 && bracketDepth === 0 && /^\s*(?:script-path|pattern|timeout|argument|script-update-interval|requires-body|max-size|ability|binary-body-mode|cronexpr?|wake-system|enabled?|engine|tag|type|img-url|debug|event-name|desc)\s*=/i.test(tail.slice(i + 1))) { end = i; break }
   }
-  if (quote || braceDepth !== 0) return { present: false, kind: 'invalid', value: null, keys: [] }
+  if (quote || braceDepth !== 0 || bracketDepth !== 0) return { present: false, kind: 'invalid', value: null, keys: [] }
   const source = tail.slice(0, end).trim()
   const object = Array.isArray(declaredArguments) ? parseLoonPluginObjectArgument(source, declaredArguments, false) : null
   if (object) return { present: true, kind: 'object', value: `{${object.keys.join(',')}}`, keys: object.keys }
@@ -2871,6 +3439,7 @@ function parseLoonScriptOptions(text, declaredArguments, jstype) {
       result[key] = Number(value)
       if (!Number.isFinite(result[key]) || result[key] <= 0) return null
     } else if (['requires_body', 'binary_body_mode'].includes(key)) {
+      if (!/^http-(request|response)$/.test(jstype)) return null
       if (!/^(?:true|false)$/.test(value)) return null
       result[key] = value === 'true'
     } else if (key === 'enable' || key === 'debug') {
@@ -2974,29 +3543,14 @@ function parseLoonRewriteV2Action(text, condition) {
 }
 
 function splitLoonV2Args(text) {
-  const result = []
-  let start = 0, quote = '', escaped = false, depth = 0, braceDepth = 0
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i]
-    if (escaped) { escaped = false; continue }
-    if (ch === '\\' && quote && quote !== '`') { escaped = true; continue }
-    if (quote) { if (ch === quote) quote = ''; continue }
-    if (ch === '"' || ch === "'" || ch === '`') { quote = ch; continue }
-    if (ch === '(') depth++
-    else if (ch === ')') depth--
-    else if (ch === '{') braceDepth++
-    else if (ch === '}') braceDepth--
-    else if (ch === ',' && depth === 0 && braceDepth === 0) { result.push(text.slice(start, i).trim()); start = i + 1 }
-  }
-  if (quote || depth !== 0 || braceDepth !== 0) return null
-  result.push(text.slice(start).trim())
-  return result
+  return scanLoonSyntax(text, ',')
 }
 
 function parseLoonV2String(text) {
   const value = text.trim()
+  if (/^`(?:[^`]|``)*`$/.test(value)) return value.slice(1, -1).replace(/``/g, '`')
   if (!/^"(?:[^"\\]|\\.)*"$/.test(value)) return null
-  try { return JSON.parse(value) } catch { return null }
+  try { return JSON.parse(value.replace(/(\\+)\$\{/g, (token, slashes) => slashes.length % 2 ? slashes.slice(1) + '${' : token)) } catch { return null }
 }
 
 function parseLoonV2Replacement(text, condition) {
@@ -3097,6 +3651,22 @@ function getJsInfo(x, regex, parserRegex) {
           : /\s(data-type|data|data-path)\s*=/.test(x)
             ? mockRegex
             : ''
+  if (parserRegex === jsRegex && /script-path\s*=/.test(x)) {
+    const parts = splitLoonV2Args(x)
+    if (parts) {
+      const fields = []
+      for (const part of parts) {
+        if (!fields.length || jsRegex.test(', ' + part)) fields.push(part)
+        else fields[fields.length - 1] += ',' + part
+      }
+      for (const [index, field] of fields.entries()) {
+        const candidate = ', ' + field
+        const matched = candidate.match(regex)
+        if (matched && (index === 0 || matched.index <= 2)) return candidate.slice(matched.index + matched[0].length).trim()
+      }
+      return ''
+    }
+  }
   if (regex.test(x)) {
     return x.split(regex)[1].split(parserRegex)[0]
   } else {
@@ -3395,6 +3965,8 @@ function shNotify(box) {
 }
 
 function getPolicy(str) {
+  const fields = scanLoonSyntax(str, ',')
+  if (fields) return fields.length > 1 ? fields[fields.length - 1].trim() : ''
   let commaNum = str.lastIndexOf(',')
   let bracesNum = str.lastIndexOf('}')
   let roundNum = str.lastIndexOf(')')

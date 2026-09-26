@@ -1,3 +1,123 @@
+function loonBodyText(body) {
+  if (typeof body === 'string' || body == null) return body
+  const bytes = body instanceof ArrayBuffer ? new Uint8Array(body) : body
+  if (!ArrayBuffer.isView(bytes) && !Array.isArray(bytes)) throw new Error('Unsupported body representation')
+  return decodeURIComponent(Array.from(bytes).map(byte => '%' + Number(byte).toString(16).padStart(2, '0')).join(''))
+}
+
+function loonBodyBytes(body) {
+  if (typeof body !== 'string') return body instanceof ArrayBuffer ? new Uint8Array(body) : body
+  const encoded = encodeURIComponent(body), bytes = []
+  for (let i = 0; i < encoded.length; i++) {
+    if (encoded[i] === '%') { bytes.push(parseInt(encoded.slice(i + 1, i + 3), 16)); i += 2 }
+    else bytes.push(encoded.charCodeAt(i))
+  }
+  return new Uint8Array(bytes)
+}
+
+function createLoonExpressionRuntime(request, response) {
+  const captures = Object.create(null)
+  function read(value) {
+    if (value.template) return value.template.map(read).join('')
+    if (!value.variable) return value.value
+    if (value.variable === 'url') return request.url
+    if (value.variable === 'request.method') return request.method
+    if (value.variable === 'response.status') return Number(response.status ?? response.statusCode)
+    const capture = value.variable.match(/^([A-Za-z_][A-Za-z0-9_]*)\.(\d+)$/)
+    if (capture) {
+      const matched = captures[capture[1]]?.[Number(capture[2])]
+      if (matched === undefined) throw new Error('Unmatched capture: ' + value.variable)
+      return matched
+    }
+    const match = value.variable.match(/^(request|response)\.header\['([^']+)'\]$/)
+    if (!match) throw new Error('Unknown variable: ' + value.variable)
+    const source = match[1] === 'request' ? request : response
+    const key = Object.keys(source.headers || {}).find(key => key.toLowerCase() === match[2].toLowerCase())
+    return key === undefined ? null : source.headers[key]
+  }
+  function matches(node) {
+    if (node.kind === 'constant') return node.value
+    if (node.kind === 'and') return node.children.every(matches)
+    if (node.kind === 'or') return node.children.some(matches)
+    if (node.kind === 'equal') return read(node.left) === read(node.right)
+    const value = read(node.left)
+    if (typeof value !== 'string') return false
+    const match = new RegExp(node.pattern, node.flags).exec(value)
+    if (match && node.capture) captures[node.capture] = match
+    return !!match
+  }
+  return { read, matches, captures }
+}
+
+async function buildLoonScriptBundle(spec, fetchSource) {
+  if (spec?.version !== 1 || !['request', 'response'].includes(spec.phase) || !Array.isArray(spec.rules) || (!spec.rules.length && !spec.rewrites?.length)) throw new Error('Invalid Loon bundle')
+  const cache = new Map()
+  const sources = await Promise.all(spec.rules.map(rule => {
+    if (!/^https?:\/\//i.test(rule.path)) throw new Error('Invalid Loon script resource')
+    if (!cache.has(rule.path)) cache.set(rule.path, fetchSource(rule.path))
+    return cache.get(rule.path)
+  }))
+  let runtime = ''
+  if (spec.rewrites?.length) {
+    const source = await fetchSource('https://raw.githubusercontent.com/Primovist/script-hub/main/scripts/loon-rewrite-v2.js')
+    const end = source.indexOf('// Script Hub runtime entry')
+    if (end < 0) throw new Error('Loon runtime is outdated: publish scripts/loon-rewrite-v2.js with the parser')
+    runtime = source.slice(0, end)
+  }
+  const functions = sources.map(source => 'function($argument, $request, $response, $done) {\n' + source.replace(/^#![^\n]*\n/, '') + '\n}')
+  return `// Loon HTTP phase: ordered rewrites followed by the first fully matching script.
+const __scriptHubNativeDone = $done;
+(async function () {
+${runtime}
+const rules = JSON.parse(${JSON.stringify(JSON.stringify(spec.rules))});
+const rewrites = JSON.parse(${JSON.stringify(JSON.stringify(spec.rewrites || []))});
+const scripts = [${functions.join(',\n')}];
+const request = typeof $request === 'undefined' ? {} : { ...$request, headers: { ...$request.headers } };
+const response = typeof $response === 'undefined' ? {} : { ...$response, headers: { ...$response.headers } };
+const originalResponse = { ...response, headers: { ...response.headers } };
+const phase = ${JSON.stringify(spec.phase)};
+let patch = {}, bodyRewriteMatched = false;
+for (const rewrite of rewrites) {
+  const expressions = (${createLoonExpressionRuntime.toString()})(request, response);
+  if (rewrite.condition && !expressions.matches(rewrite.condition)) continue;
+  const changed = await runLoonRewriteWithResources(rewrite, request, response);
+  if (changed.response) { __scriptHubNativeDone(changed); return; }
+  Object.assign(patch, changed);
+  Object.assign(phase === 'request' ? request : response, changed);
+  if (rewrite.actions.some(action => /^(body|json)\\./.test(action.name))) bodyRewriteMatched = true;
+}
+if (bodyRewriteMatched) { __scriptHubNativeDone(patch); return; }
+const expressions = (${createLoonExpressionRuntime.toString()})(request, phase === 'response' ? originalResponse : response);
+for (let i = 0; i < rules.length; i++) {
+  const rule = rules[i];
+  if (!expressions.matches(rule.condition)) continue;
+  const req = { ...request }, res = { ...response };
+  const bodyOwner = phase === 'request' ? req : res;
+  if (!rule.requiresBody) { delete bodyOwner.body; delete bodyOwner.bodyBytes; }
+  else if (rule.binary) bodyOwner.bodyBytes = (${loonBodyBytes.toString()})(bodyOwner.bodyBytes ?? bodyOwner.body);
+  else {
+    bodyOwner.body = (${loonBodyText.toString()})(bodyOwner.body ?? bodyOwner.bodyBytes);
+    delete bodyOwner.bodyBytes;
+  }
+  let completed = false, deadline;
+  const finish = value => {
+    if (completed) return;
+    completed = true;
+    if (deadline) clearTimeout(deadline);
+    const output = { ...patch, ...(value || {}) };
+    if (output.bodyBytes != null) { output.body = output.bodyBytes; delete output.bodyBytes; }
+    if (output.response?.bodyBytes != null) { output.response.body = output.response.bodyBytes; delete output.response.bodyBytes; }
+    __scriptHubNativeDone(output);
+  };
+  if (rule.timeout > 0) deadline = setTimeout(() => { console.log('Loon Script timeout: ' + rule.name); finish({}); }, rule.timeout * 1000);
+  try { scripts[i](rule.argument, req, res, finish); }
+  catch (error) { console.log('Loon Script ' + rule.name + ': ' + error); finish({}); }
+  return;
+}
+__scriptHubNativeDone(patch);
+})().catch(error => { console.log('Loon dispatcher: ' + error); __scriptHubNativeDone({}); });`
+}
+
 const TITLE = `Script Hub: 脚本转换`
 const NAME = `script-converter`
 
@@ -290,7 +410,16 @@ global.$done = _scriptSonverterDone
   let contentType
   let shouldCache
 
-  if (subconverter) {
+  if (type === 'loon-bundle-script') {
+    const bundle = JSON.parse(queryObject.loonBundle || '{}')
+    body = await buildLoonScriptBundle(bundle, async path => {
+      const response = await http(path, { ...reqHeaders })
+      if (Number(response.status ?? response.statusCode) !== 200 || typeof response.body !== 'string') throw new Error('Unable to fetch Loon script: ' + path)
+      return response.body
+    })
+    status = 200
+    headers = { 'Content-Type': 'text/javascript; charset=utf-8' }
+  } else if (subconverter) {
     body = $.lodash_get(
       await http(subconverter, {
         ...reqHeaders,

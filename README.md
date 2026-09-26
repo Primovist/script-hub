@@ -27,7 +27,7 @@ Advanced Script Converter for QX, Loon, Surge, Stash, Egern, LanceX and Shadowro
 
 • 支持将 Surge 模块解析至 Loon Stash
 
-• 支持将 Loon 插件解析至 Surge Shadowrocket Stash
+• 支持将 Loon 插件解析至 Surge Shadowrocket Stash；[Loon V2 / Argument 支持范围](docs/loon-v2.md)
 
 • 支持 QX & Surge & Loon & Shadowrocket & Clash 规则集解析，适用 app: Surge Shadowrocket Stash Loon
 
