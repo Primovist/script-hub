@@ -437,7 +437,11 @@ if (binaryInfo != null && binaryInfo.length > 0) {
       if (isLooniOS) { URLRewrite.push(protectLoonOutputLiteral(bindLoonResourceReferences(x, reqArr.length === 1 ? reqArr[0] : ''))); continue }
       const v2 = parseLoonRewriteV2(x, sgArg)
       const legacy = v2.ok ? loonRewriteV2ToLegacy(v2) : null
-      if (legacy && !parseLoonExtendedRewrite(x, sgArg)) {
+      // Prefer the native URL Rewrite path whenever the restricted parser has
+      // proved the action is exactly representable. The extended parser also
+      // accepts these actions, but routing them through JavaScript widens the
+      // trigger to every URL and needlessly depends on the dispatcher asset.
+      if (legacy) {
         mark = getMark(y, body)
         rwBox.push({ mark, noteK: v2.condition.disabledByDefault, ...legacy })
         loonV2Stats.convertedV2Count++

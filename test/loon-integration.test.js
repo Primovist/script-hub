@@ -47,6 +47,8 @@ hostname = example.com`
     const output = await convert(file, input)
     assert.strictEqual(output.status, 200, output.body)
     assert.match(output.body, /loon-(argument|dispatch)\.js/)
+    assert.match(output.body, /\[Map Local\]\nad data-type=text data="\{\}" status-code=200/)
+    assert.doesNotMatch(output.body, /loon-request-dispatch/)
     assert.match(output.body, /DOMAIN,default.example.com,DIRECT/)
     assert.match(output.body, /FINAL,DIRECT/)
     assert.match(output.body, /DOMAIN,REJECT.example.com,REJECT/)
