@@ -22,6 +22,29 @@ async function main() {
     const fixture = await convert(file, fs.readFileSync('test/fixtures/loon-v2.plugin', 'utf8'))
     assert.strictEqual(fixture.status, 200, fixture.body)
     assert.doesNotMatch(fixture.body, /unconverted source entries|__SCRIPT_HUB_LOON_LITERAL_/)
+    const redpaperSource = fs.readFileSync('test/fixtures/redpaper-v2.plugin', 'utf8')
+    const redpaper = await convert(file, redpaperSource)
+    assert.strictEqual(redpaper.status, 200, redpaper.body)
+    assert.doesNotMatch(redpaper.body, /loon-.*dispatch|loon-rewrite-v2\.js|unconverted source entries|pattern=\^https\?:\/\//)
+    const section = name => redpaper.body.match(new RegExp('\\[' + name + '\\]\\n([\\s\\S]*?)(?=\\n\\[|$)'))?.[1].split('\n').filter(line => line.trim() && !line.startsWith('#')) || []
+    assert.strictEqual(section('Rule').length, 1)
+    assert.match(section('Rule')[0], /PROTOCOL,QUIC/)
+    assert.strictEqual(section('Map Local').length, 5)
+    const jsonRules = section('Body Rewrite')
+    assert.strictEqual(jsonRules.length, 4)
+    assert(jsonRules.every(line => line.startsWith('http-response-jq ')))
+    const scripts = section('Script')
+    assert.strictEqual(scripts.length, 12)
+    const sourceScripts = [...redpaperSource.matchAll(/^response if \$\{url\} ~= \/(.+)\/i then script\("([^"]+)"\)/gm)]
+    for (let i = 0; i < sourceScripts.length; i++) {
+      assert(scripts[i].includes(', pattern=(?i)' + sourceScripts[i][1] + ', script-path=' + sourceScripts[i][2]), scripts[i])
+      assert(scripts[i].includes('requires-body=true'), scripts[i])
+    }
+    // Quoted JSON-looking values remain strings; both batched paths must survive.
+    const trending = JSON.parse(jsonRules[3].match(/^http-response-jq \S+ (.+)$/)[1])
+    assert(trending.includes('setpath(["data","queries"];"[]")'))
+    assert(trending.includes('setpath(["data","hint_word"];"{}")'))
+    assert.match(redpaper.body, /Rewrite 9\/9 converted, 0 unsupported; Script 12\/12 converted, 0 unsupported/)
     const input = `#!name=V2 Test
 [Script]
 request if \${url} ~= /api/ then script("https://example.com/script.js", {\${region}, \${level}, \${enabled}})

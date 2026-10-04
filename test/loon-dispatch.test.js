@@ -90,8 +90,8 @@ request if \${url} ~= /api/ then script("https://example.com/fallback.js", "fall
     await assert.rejects(() => converter.buildLoonScriptBundle(bundle, async () => { throw new Error('download failed') }), /download failed/)
 
     const rewriteSource = `[Rewrite]
-response if \${url} ~= /api/ then response.json.delete("ad")
-response if \${url} ~= /api/ then response.json.replace("count", 2)
+response if \${url} ~= /api/ && \${response.status} == 200 then response.json.delete("ad")
+response if \${url} ~= /api/ && \${response.status} == 200 then response.json.replace("count", 2)
 [Script]
 response if \${url} ~= /api/ then script("https://example.com/not-called.js") with requires_body=true
 `
@@ -99,7 +99,7 @@ response if \${url} ~= /api/ then script("https://example.com/not-called.js") wi
     const rewriteBundle = bundleFrom(rewritten.body)
     assert.strictEqual(rewriteBundle.rewrites.length, 2)
     const program = await converter.buildLoonScriptBundle(rewriteBundle, async url => url.endsWith('loon-rewrite-v2.js') ? runtimeSource : '$done({ body: "WRONG: body rewrite must suppress script" });')
-    assert.deepStrictEqual(JSON.parse((await execute(program, { url: 'https://example.com/api' }, { body: '{"ad":1,"count":0}' })).body), { count: 2 })
+    assert.deepStrictEqual(JSON.parse((await execute(program, { url: 'https://example.com/api' }, { status: 200, body: '{"ad":1,"count":0}' })).body), { count: 2 })
 
     const headerSource = `[Rewrite]
 response if \${url} ~= /api/ then response.header.set("X-Cache", "new")

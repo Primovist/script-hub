@@ -459,15 +459,16 @@ if (binaryInfo != null && binaryInfo.length > 0) {
             continue
           }
         }
-        const converted = (extended && loonExtendedRewriteScript(extended, _x, y)) || loonRejectScript(v2, _x, y)
-        if (converted) {
-          jsBox.push(converted)
-          loonV2Stats.convertedV2Count++
-          continue
-        }
+        // Static JSON-only actions can use Surge natively, before the JS fallback.
         const jqProgram = extended && isSurgeiOS ? loonNativeJQProgram(extended) : null
         if (jqProgram != null) {
           BodyRewrite.push(protectLoonOutputLiteral(`${extended.condition.disabledByDefault ? '#' : ''}http-${extended.phase}-jq ${loonV2RegexForLegacy(extended.condition.pattern, extended.condition.flags)} ${JSON.stringify(jqProgram)}`))
+          loonV2Stats.convertedV2Count++
+          continue
+        }
+        const converted = (extended && loonExtendedRewriteScript(extended, _x, y)) || loonRejectScript(v2, _x, y)
+        if (converted) {
+          jsBox.push(converted)
           loonV2Stats.convertedV2Count++
           continue
         }
