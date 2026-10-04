@@ -2293,6 +2293,36 @@ function uniqueLoonScripts(items) {
   })
 }
 
+function loonDispatchURLGuard(condition) {
+  if (!condition) return null
+  if (condition.kind === 'regex' && condition.left?.variable === 'url') {
+    return [{ pattern: condition.pattern, flags: condition.flags || '' }]
+  }
+  if (condition.kind === 'equal' && condition.left?.variable === 'url' && typeof condition.right?.value === 'string') {
+    const escaped = condition.right.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    return [{ pattern: '^' + escaped + '$', flags: '' }]
+  }
+  if (condition.kind === 'and') {
+    // One mandatory child is enough to safely narrow this rule's URL scope.
+    for (const child of condition.children || []) {
+      const guards = loonDispatchURLGuard(child)
+      if (guards?.length) return guards
+    }
+    return null
+  }
+  if (condition.kind === 'or') {
+    // Every successful branch must carry a URL guard or the union would drop
+    // requests that the dispatcher still needs to evaluate.
+    const branches = (condition.children || []).map(loonDispatchURLGuard)
+    if (!branches.length || branches.some(branch => !branch?.length)) return null
+    const guards = branches.flat()
+    const flags = new Set(guards.map(guard => guard.flags))
+    if (flags.size !== 1) return null
+    return [{ pattern: guards.map(guard => '(?:' + guard.pattern + ')').join('|'), flags: guards[0].flags }]
+  }
+  return null
+}
+
 function resolveLoonResourceURL(path, source) {
   if (/^https?:\/\//i.test(path)) return path
   const base = String(source || '').match(/^(https?:\/\/[^/]+)(\/[^?#]*)?/i)
@@ -2370,12 +2400,21 @@ function groupLoonHTTPScripts(items, declarations, target, source) {
       }
       return spec
     })
+    const dispatchConditions = [...rules.map(rule => rule.condition), ...rewriteSpecs.map(rewrite => rewrite.condition)]
+    const dispatchGuards = dispatchConditions.map(loonDispatchURLGuard)
+    // Only merge rules when a strict URL union can be proven. Otherwise leave
+    // each rule on its original trigger regex instead of widening the hook.
+    if (!dispatchGuards.length || dispatchGuards.some(guards => !guards?.length)) continue
+    const guards = dispatchGuards.flat()
+    const flags = new Set(guards.map(guard => guard.flags))
+    if (flags.size !== 1) continue
+    const dispatchPattern = loonV2RegexForLegacy(guards.map(guard => '(?:' + guard.pattern + ')').join('|'), guards[0].flags)
     const bundle = { version: 1, phase, rules, rewrites: rewriteSpecs }
     const runtimeURL = 'https://raw.githubusercontent.com/Primovist/script-hub/main/scripts/loon-rewrite-v2.js'
     const jsurl = 'http://script.hub/convert/_start_/' + runtimeURL + '/_end_/loon-dispatch.js?type=loon-bundle-script&target=' + target.split('-')[0] + '-script&loonBundle=' + encodeURIComponent(JSON.stringify(bundle))
     const grouped = [...candidates, ...rewrites].sort((a, b) => a.num - b.num)
     const first = grouped[0]
-    replacements.set(first, { ...first, jsname: `loon-${phase}-dispatch`, jsptn: '^https?://', jsurl,
+    replacements.set(first, { ...first, jsname: `loon-${phase}-dispatch`, jsptn: dispatchPattern, jsurl,
       rebody: grouped.some(item => item.rebody === 'true') ? 'true' : '', proto: grouped.some(item => item.proto === 'true') ? 'true' : '',
       timeout: String(Math.max(20, ...grouped.map(item => Number(item.timeout) || 20))),
       jsarg: '', jsargPresent: false, jsargKind: 'none', jsargKeys: [], runtimeCondition: undefined,
