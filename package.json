@@ -10,7 +10,8 @@
     "service": "nodemon service.js",
     "preview": "nodemon preview.js",
     "export_html": "cross-env EXPORT_HTML=true node preview.js",
-    "test": "node test/loon-rewrite-v2.test.js && node test/loon-integration.test.js && node test/loon-dispatch.test.js && find . -path './node_modules' -prune -o -name '*.js' -print0 | xargs -0 -n1 node --check"
+    "test": "node test/loon-rewrite-v2.test.js && node test/loon-integration.test.js && node test/loon-dispatch.test.js && find . -path './node_modules' -prune -o -name '*.js' -print0 | xargs -0 -n1 node --check",
+    "test:loon-v2": "node --test tests/loon-v2-parser.test.cjs"
   },
   "license": "GPL-3.0",
   "dependencies": {
@@ -25,5 +26,5 @@
     "script-hub": "file:",
     "tough-cookie": "^4.0.0"
   },
-  "packageManager": "pnpm@11.19.0"
+  "packageManager": "pnpm@9.1.0"
 }
